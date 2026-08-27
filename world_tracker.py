@@ -6,8 +6,7 @@ import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
 import tkinter as tk
-from tkinter import Tk, StringVar, BooleanVar, IntVar
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 SOURCE_URL = "https://oldschool.runescape.com/slu"
 APP_NAME = "Cake Powder / Faithful Few – OSRS World Tracker"
@@ -35,19 +34,22 @@ class Hop:
 
 
 class TableParser(HTMLParser):
+    """Extracts only rows from the actual world-list table."""
     def __init__(self):
         super().__init__()
         self.in_tr = False
         self.in_cell = False
-        self.rows = []
         self.current = []
         self.buffer = []
+        self.rows = []
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         if tag == "tr":
             self.in_tr = True
+            self.in_cell = False
             self.current = []
+            self.buffer = []
         elif tag in ("td", "th") and self.in_tr:
             self.in_cell = True
             self.buffer = []
@@ -68,12 +70,16 @@ class TableParser(HTMLParser):
                 self.rows.append(self.current)
             self.in_tr = False
             self.current = []
+            self.buffer = []
 
 
 def fetch_worlds():
     req = urllib.request.Request(
         SOURCE_URL,
-        headers={"User-Agent": "CakePowder-OSRS-World-Tracker/2.0"},
+        headers={
+            "User-Agent": "CakePowder-OSRS-World-Tracker/2.0",
+            "Accept": "text/html,application/xhtml+xml",
+        },
     )
     with urllib.request.urlopen(req, timeout=12) as response:
         raw = response.read().decode("utf-8", errors="replace")
@@ -83,355 +89,536 @@ def fetch_worlds():
 
     worlds = {}
     for row in parser.rows:
-        # The current OSRS page contains quick-select rows before the world table.
-        # Only accept the exact five-column world-list shape and a numeric world
-        # name plus a player-count cell (including blank/offline counts).
         if len(row) < 5:
             continue
-        world_match = re.fullmatch(r"Old School\s+(\d+)", row[0], re.I)
-        if not world_match:
+
+        # Actual world-table rows have this exact structure:
+        # Old School XXX | N players | Location | Members/Free | Activity
+        m_world = re.fullmatch(r"Old School\s+(\d+)", row[0], re.I)
+        m_players = re.fullmatch(r"([\d,]+)\s+players?", row[1], re.I)
+
+        if not m_world or not m_players:
             continue
-        players_text = row[1].strip()
-        if players_text:
-            players_match = re.fullmatch(r"([\d,]+)\s+players?", players_text, re.I)
-            if not players_match:
-                continue
-            players = int(players_match.group(1).replace(",", ""))
-        else:
-            # Offline/empty cells are still valid world rows; treat them as 0.
-            players = 0
+
         membership = row[3].strip()
-        if membership not in ("Free", "Members"):
+        if membership not in ("Members", "Free"):
             continue
-        world = int(world_match.group(1))
-        worlds[world] = World(world, players, row[2], membership, row[4])
+
+        world_id = int(m_world.group(1))
+        players = int(m_players.group(1).replace(",", ""))
+
+        worlds[world_id] = World(
+            world=world_id,
+            players=players,
+            location=row[2].strip(),
+            membership=membership,
+            activity=row[4].strip() or "-",
+        )
 
     if not worlds:
-        raise RuntimeError("No OSRS worlds were found in the response.")
-    return worlds
+        raise RuntimeError("No OSRS world rows were found.")
+
+    return sorted(worlds.values(), key=lambda w: w.world)
 
 
-def filtered_worlds(worlds, include_f2p):
-    if include_f2p:
-        return dict(worlds)
-    return {wid: w for wid, w in worlds.items() if w.membership == "Members"}
+def detect_hops(previous, current, min_group):
+    """Find likely source->destination movements between two snapshots.
 
-
-def detect_hops(previous, current, minimum_group, minimum_confidence):
+    Confidence is deliberately a likelihood estimate, not proof that the
+    same accounts moved. It combines population matching and how dominant
+    the source/destination changes are among all changes in the snapshot.
+    """
     drops = []
     gains = []
-    for world_id in set(previous) & set(current):
-        delta = current[world_id].players - previous[world_id].players
-        if delta <= -minimum_group:
-            drops.append((world_id, -delta))
-        elif delta >= minimum_group:
-            gains.append((world_id, delta))
 
+    common = set(previous) & set(current)
+    for wid in common:
+        delta = current[wid].players - previous[wid].players
+        if delta <= -min_group:
+            drops.append([wid, -delta])
+        elif delta >= min_group:
+            gains.append([wid, delta])
+
+    if not drops or not gains:
+        return []
+
+    total_drop = sum(x[1] for x in drops)
+    total_gain = sum(x[1] for x in gains)
+
+    # Largest/strongest pairings first.
     candidates = []
     for source, left in drops:
         for destination, appeared in gains:
-            if source == destination:
-                continue
-            match = min(left, appeared) / max(left, appeared)
-            size_score = min(1.0, min(left, appeared) / max(50, minimum_group * 8))
-            confidence = round((match * 0.88 + size_score * 0.12) * 100)
-            confidence = max(0, min(99, confidence))
-            moved = min(left, appeared)
-            candidates.append((confidence, source, destination, left, appeared, moved))
+            ratio = min(left, appeared) / max(left, appeared)
+            source_share = left / total_drop if total_drop else 0
+            dest_share = appeared / total_gain if total_gain else 0
+
+            # 55% population match, 25% source dominance, 20% destination dominance.
+            score = 55 * ratio + 25 * source_share + 20 * dest_share
+            candidates.append((score, source, destination, left, appeared))
 
     candidates.sort(reverse=True)
+
     used_sources = set()
     used_destinations = set()
-    results = []
-    for confidence, source, destination, left, appeared, moved in candidates:
-        if confidence < minimum_confidence:
-            continue
+    result = []
+
+    for score, source, destination, left, appeared in candidates:
         if source in used_sources or destination in used_destinations:
             continue
-        used_sources.add(source)
-        used_destinations.add(destination)
-        results.append(Hop(source, destination, left, appeared, moved, confidence, time.time()))
-    return results
+
+        moved = min(left, appeared)
+        confidence = max(0, min(99, round(score)))
+
+        # Don't report weak matches. The UI also has its own confidence filter.
+        if confidence >= 50:
+            result.append(
+                Hop(
+                    source=source,
+                    destination=destination,
+                    players_left=left,
+                    players_appeared=appeared,
+                    players_moved=moved,
+                    confidence=confidence,
+                    timestamp=time.time(),
+                )
+            )
+            used_sources.add(source)
+            used_destinations.add(destination)
+
+    return result
 
 
-class App:
+class WorldTrackerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("1380x820")
-        self.root.minsize(1050, 680)
+        self.root.geometry("1260x760")
+        self.root.minsize(1000, 650)
 
-        self.previous = None
-        self.current = {}
+        self.worlds = []
+        self.previous_snapshot = None
         self.history = []
         self.running = True
-        self.fetching = False
+        self.baseline_ready = False
+        self.last_update = None
 
-        self.mode = StringVar(value="hops")
-        self.minimum_group = IntVar(value=10)
-        self.minimum_confidence = IntVar(value=75)
-        self.only_likely = BooleanVar(value=True)
-        self.notifications = BooleanVar(value=True)
-        self.keep_history = BooleanVar(value=True)
-        self.include_f2p = BooleanVar(value=False)
-        self.status = StringVar(value="Starting…")
-        self.updated = StringVar(value="Waiting for first update")
+        self.f2p_var = tk.BooleanVar(value=False)
+        self.min_group_var = tk.IntVar(value=10)
+        self.min_conf_var = tk.IntVar(value=75)
+        self.keep_history_var = tk.BooleanVar(value=True)
+        self.notifications_var = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="Starting…")
+        self.view_var = tk.StringVar(value="hops")
 
-        self._configure_style()
+        self._build_styles()
         self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.refresh_async()
 
-    def _configure_style(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(150, self.start_refresh)
+
+    def _build_styles(self):
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TFrame", background="#080c12")
-        style.configure("Panel.TFrame", background="#0d131c")
-        style.configure("TLabel", background="#0d131c", foreground="#d9e1ec", font=("Segoe UI", 10))
-        style.configure("Title.TLabel", background="#080c12", foreground="#ffffff", font=("Segoe UI", 18, "bold"))
-        style.configure("Brand.TLabel", background="#080c12", foreground="#a970ff", font=("Segoe UI", 10, "bold"))
-        style.configure("Heading.TLabel", background="#0d131c", foreground="#a970ff", font=("Segoe UI", 11, "bold"))
-        style.configure("Subtle.TLabel", background="#0d131c", foreground="#8995a5", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background="#080c12", foreground="#6fe58a", font=("Segoe UI", 9))
-        style.configure("TButton", background="#151d28", foreground="#eaf0f7", borderwidth=0, padding=(12, 8))
-        style.map("TButton", background=[("active", "#252f3d")])
-        style.configure("Accent.TButton", background="#713bd4", foreground="#ffffff", padding=(12, 8))
-        style.map("Accent.TButton", background=[("active", "#8b54ef")])
-        style.configure("TCheckbutton", background="#0d131c", foreground="#d9e1ec", padding=(2, 3))
-        style.map("TCheckbutton", background=[("active", "#0d131c")])
-        style.configure("TSpinbox", fieldbackground="#101822", background="#101822", foreground="#ffffff", arrowcolor="#a970ff", padding=4)
-        style.configure("Treeview", background="#0b1119", fieldbackground="#0b1119", foreground="#d9e1ec", rowheight=34, borderwidth=0, font=("Segoe UI", 9))
-        style.configure("Treeview.Heading", background="#111923", foreground="#aeb9c8", font=("Segoe UI", 9, "bold"), padding=7)
-        style.map("Treeview", background=[("selected", "#2b1d4d")], foreground=[("selected", "#ffffff")])
 
-    def panel(self, parent, **kwargs):
-        return ttk.Frame(parent, style="Panel.TFrame", padding=kwargs.get("padding", 14))
+        bg = "#080d16"
+        panel = "#101722"
+        panel2 = "#131d2a"
+        fg = "#e8edf5"
+        muted = "#9aa8ba"
+        purple = "#9b5cff"
+        purple2 = "#6f35d9"
+        green = "#55d88a"
+
+        self.colors = {
+            "bg": bg, "panel": panel, "panel2": panel2,
+            "fg": fg, "muted": muted, "purple": purple,
+            "purple2": purple2, "green": green,
+        }
+
+        self.root.configure(bg=bg)
+
+        style.configure("TFrame", background=bg)
+        style.configure("Panel.TFrame", background=panel)
+        style.configure("TLabel", background=bg, foreground=fg, font=("Segoe UI", 10))
+        style.configure("Muted.TLabel", background=bg, foreground=muted, font=("Segoe UI", 9))
+        style.configure("Title.TLabel", background=bg, foreground="white",
+                        font=("Segoe UI", 20, "bold"))
+        style.configure("Brand.TLabel", background=bg, foreground=purple,
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("Section.TLabel", background=panel, foreground=purple,
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", font=("Segoe UI", 9, "bold"), padding=(12, 7))
+        style.map("TButton",
+                  background=[("active", purple2)],
+                  foreground=[("active", "white")])
+
+        style.configure("View.TButton", background=panel2, foreground=fg,
+                        padding=(14, 8), borderwidth=0)
+        style.map("View.TButton",
+                  background=[("active", purple2)])
+        style.configure("Treeview",
+                        background="#0b111b", fieldbackground="#0b111b",
+                        foreground=fg, rowheight=32, borderwidth=0,
+                        font=("Segoe UI", 9))
+        style.configure("Treeview.Heading",
+                        background=panel2, foreground="#dfe5ef",
+                        font=("Segoe UI", 9, "bold"), padding=(8, 9))
+        style.map("Treeview",
+                  background=[("selected", "#43258a")],
+                  foreground=[("selected", "white")])
+
+        style.configure("Horizontal.TProgressbar", background=purple)
 
     def _build_ui(self):
-        header = ttk.Frame(self.root, padding=(18, 12))
-        header.pack(fill="x")
-        ttk.Label(header, text="Cake Powder", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text=" /  FAITHFUL FEW", style="Brand.TLabel").pack(side="left", padx=8)
-        ttk.Label(header, textvariable=self.status, style="Status.TLabel").pack(side="right")
+        # Header
+        header = ttk.Frame(self.root, padding=(18, 14, 18, 10))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
 
+        left = ttk.Frame(header)
+        left.grid(row=0, column=0, sticky="w")
+        ttk.Label(left, text="Cake Powder", style="Title.TLabel").pack(side="left")
+        ttk.Label(left, text="  /  FAITHFUL FEW", style="Brand.TLabel").pack(side="left", padx=(4, 0))
+
+        ttk.Label(header, textvariable=self.status_var,
+                  style="Muted.TLabel").grid(row=0, column=1, sticky="e", padx=12)
+
+        self.refresh_btn = ttk.Button(header, text="Refresh Now", command=self.manual_refresh)
+        self.refresh_btn.grid(row=0, column=2, sticky="e")
+
+        # Toolbar
         toolbar = ttk.Frame(self.root, padding=(18, 0, 18, 12))
-        toolbar.pack(fill="x")
-        self.world_btn = ttk.Button(toolbar, text="Worlds", command=lambda: self.set_mode("worlds"))
-        self.world_btn.pack(side="left")
-        self.hop_btn = ttk.Button(toolbar, text="Group Hops", command=lambda: self.set_mode("hops"))
-        self.hop_btn.pack(side="left", padx=(6, 16))
-        ttk.Checkbutton(toolbar, text="Include F2P worlds", variable=self.include_f2p, command=self.toggle_f2p).pack(side="left")
-        ttk.Button(toolbar, text="Refresh Now", command=self.refresh_async).pack(side="right")
-        ttk.Label(toolbar, text="Live polling: 10s", foreground="#8995a5", background="#080c12").pack(side="right", padx=(0, 12))
+        toolbar.grid(row=1, column=0, sticky="ew")
+        toolbar.columnconfigure(3, weight=1)
 
-        self.body = ttk.Frame(self.root, padding=(18, 0, 18, 18))
-        self.body.pack(fill="both", expand=True)
-        self._build_hop_view()
-        self._update_mode_buttons()
+        self.world_btn = ttk.Button(toolbar, text="◉  Worlds",
+                                    style="View.TButton",
+                                    command=lambda: self.set_view("worlds"))
+        self.world_btn.grid(row=0, column=0, padx=(0, 6))
 
-    def _clear_body(self):
-        for child in self.body.winfo_children():
-            child.destroy()
+        self.hop_btn = ttk.Button(toolbar, text="◉  Group Hops",
+                                  style="View.TButton",
+                                  command=lambda: self.set_view("hops"))
+        self.hop_btn.grid(row=0, column=1, padx=(0, 18))
 
-    def _build_hop_view(self):
-        self._clear_body()
-        container = ttk.Frame(self.body)
-        container.pack(fill="both", expand=True)
-        container.columnconfigure(1, weight=1)
-        container.rowconfigure(0, weight=1)
+        ttk.Separator(toolbar, orient="vertical").grid(row=0, column=2, sticky="ns", padx=6)
 
-        left = self.panel(container)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        left.columnconfigure(1, weight=1)
-        ttk.Label(left, text="DETECTION SETTINGS", style="Heading.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        ttk.Checkbutton(toolbar, text="Include F2P worlds",
+                        variable=self.f2p_var,
+                        command=self.on_filter_changed).grid(row=0, column=3, sticky="w")
 
-        self._setting_grid(left, 1, "Detection window", ttk.Label(left, text="10 seconds", anchor="e"))
-        self._setting_grid(left, 2, "Minimum group size", ttk.Spinbox(left, from_=2, to=5000, textvariable=self.minimum_group, width=7, command=self.render_hops))
-        self._setting_grid(left, 3, "Minimum confidence", ttk.Spinbox(left, from_=1, to=99, textvariable=self.minimum_confidence, width=7, command=self.render_hops))
+        ttk.Label(toolbar, text="10-second detection window",
+                  style="Muted.TLabel").grid(row=0, column=4, sticky="e")
 
-        ttk.Separator(left).grid(row=4, column=0, columnspan=2, sticky="ew", pady=12)
-        ttk.Checkbutton(left, text="Only show likely hops", variable=self.only_likely, command=self.render_hops).grid(row=5, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Checkbutton(left, text="Play notification", variable=self.notifications).grid(row=6, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Checkbutton(left, text="Keep history", variable=self.keep_history, command=self.render_hops).grid(row=7, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Button(left, text="Clear History", command=self.clear_history).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 18))
+        # Main content
+        content = ttk.Frame(self.root, padding=(18, 0, 18, 18))
+        content.grid(row=2, column=0, sticky="nsew")
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(0, weight=1)
 
-        ttk.Label(left, text="CONFIDENCE GUIDE", style="Heading.TLabel").grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        guide = [("90–100%", "Very Likely", "#63e56f"), ("75–89%", "Likely", "#ffb62e"), ("50–74%", "Possible", "#c9a4ff"), ("0–49%", "Unlikely", "#ff5252")]
-        for i, (score, label, colour) in enumerate(guide, start=10):
-            ttk.Label(left, text=score, foreground=colour).grid(row=i, column=0, sticky="w", pady=2)
-            ttk.Label(left, text=label, foreground=colour).grid(row=i, column=1, sticky="w", padx=(10, 0), pady=2)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
-        ttk.Label(left, text="\nA likelihood estimate based on matching\npopulation drops and gains in the same\n10-second snapshot.", style="Subtle.TLabel", justify="left").grid(row=14, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        # Settings panel
+        settings = ttk.Frame(content, style="Panel.TFrame", padding=16)
+        settings.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        settings.columnconfigure(1, weight=1)
 
-        main = self.panel(container)
-        main.grid(row=0, column=1, sticky="nsew")
-        main.columnconfigure(0, weight=1)
-        main.rowconfigure(1, weight=1)
-        ttk.Label(main, text="GROUP HOP DETECTIONS", style="Heading.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ttk.Label(settings, text="DETECTION SETTINGS",
+                  style="Section.TLabel").grid(row=0, column=0, columnspan=2,
+                                                sticky="w", pady=(0, 16))
 
-        table_frame = ttk.Frame(main)
-        table_frame.grid(row=1, column=0, sticky="nsew")
-        table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(table_frame, columns=("from", "to", "left", "appeared", "moved", "confidence", "detected"), show="headings")
-        headers = [("from", "FROM"), ("to", "TO"), ("left", "PLAYERS LEFT"), ("appeared", "PLAYERS APPEARED"), ("moved", "EST. MOVED"), ("confidence", "SAME GROUP"), ("detected", "TIME")]
-        widths = {"from": 75, "to": 75, "left": 115, "appeared": 145, "moved": 110, "confidence": 115, "detected": 90}
-        for key, title in headers:
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=widths[key], anchor="center", stretch=key in ("left", "appeared", "moved", "confidence"))
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.bind("<<TreeviewSelect>>", self.show_detail)
-        self.tree.tag_configure("very", foreground="#68e27a")
-        self.tree.tag_configure("likely", foreground="#ffb52e")
-        self.tree.tag_configure("possible", foreground="#c9a4ff")
-        self.detail = ttk.Label(main, text="Select a detection to see the exact population changes.", style="Subtle.TLabel", justify="left")
-        self.detail.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(settings, text="Detection window").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Label(settings, text="10 seconds", style="Muted.TLabel").grid(
+            row=1, column=1, sticky="e", pady=6)
 
-    def _setting_grid(self, parent, row, label, widget):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
-        widget.grid(row=row, column=1, sticky="e", pady=5)
+        ttk.Label(settings, text="Minimum group size").grid(row=2, column=0, sticky="w", pady=6)
+        spin = ttk.Spinbox(settings, from_=1, to=500, textvariable=self.min_group_var,
+                           width=8, command=self.reset_baseline)
+        spin.grid(row=2, column=1, sticky="e", pady=6)
 
-    def set_mode(self, mode):
-        self.mode.set(mode)
-        if mode == "hops":
-            self._build_hop_view()
+        ttk.Label(settings, text="Minimum confidence").grid(row=3, column=0, sticky="w", pady=6)
+        spin2 = ttk.Spinbox(settings, from_=0, to=99, textvariable=self.min_conf_var,
+                            width=8)
+        spin2.grid(row=3, column=1, sticky="e", pady=6)
+
+        ttk.Separator(settings).grid(row=4, column=0, columnspan=2,
+                                     sticky="ew", pady=12)
+
+        ttk.Checkbutton(settings, text="Play notification",
+                        variable=self.notifications_var).grid(
+                            row=5, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(settings, text="Keep history",
+                        variable=self.keep_history_var).grid(
+                            row=6, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Button(settings, text="Clear Detection History",
+                   command=self.clear_history).grid(
+                       row=7, column=0, columnspan=2, sticky="ew", pady=(12, 4))
+
+        ttk.Separator(settings).grid(row=8, column=0, columnspan=2,
+                                     sticky="ew", pady=16)
+
+        ttk.Label(settings, text="CONFIDENCE GUIDE",
+                  style="Section.TLabel").grid(row=9, column=0, columnspan=2,
+                                                sticky="w", pady=(0, 10))
+
+        guide = [
+            ("90–99%", "Very likely", "#55d88a"),
+            ("75–89%", "Likely", "#f0c75e"),
+            ("50–74%", "Possible", "#f09b32"),
+            ("0–49%", "Unlikely", "#ff5d67"),
+        ]
+        for i, (pct, text, color) in enumerate(guide, start=10):
+            ttk.Label(settings, text=pct,
+                      foreground=color, background=self.colors["panel"],
+                      font=("Segoe UI", 9, "bold")).grid(
+                          row=i, column=0, sticky="w", pady=3)
+            ttk.Label(settings, text=text,
+                      foreground=color, background=self.colors["panel"]).grid(
+                          row=i, column=1, sticky="w", pady=3)
+
+        ttk.Label(
+            settings,
+            text="The likelihood estimates whether a population drop\n"
+                 "and rise are consistent with the same group moving.\n"
+                 "It is not proof that the same accounts moved.",
+            foreground=self.colors["muted"],
+            background=self.colors["panel"],
+            justify="left",
+            font=("Segoe UI", 9),
+        ).grid(row=14, column=0, columnspan=2, sticky="sw", pady=(22, 0))
+
+        # Main table panel
+        self.table_panel = ttk.Frame(content, style="Panel.TFrame", padding=14)
+        self.table_panel.grid(row=0, column=1, sticky="nsew")
+        self.table_panel.columnconfigure(0, weight=1)
+        self.table_panel.rowconfigure(1, weight=1)
+
+        self.panel_title = ttk.Label(self.table_panel, text="GROUP HOP DETECTIONS",
+                                     style="Section.TLabel")
+        self.panel_title.grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        self.tree = ttk.Treeview(self.table_panel, show="headings")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(self.table_panel, orient="vertical",
+                                  command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+
+        self.detail_var = tk.StringVar(value="Select a detection to see details.")
+        ttk.Label(self.table_panel, textvariable=self.detail_var,
+                  style="Muted.TLabel", justify="left").grid(
+                      row=2, column=0, sticky="w", pady=(10, 0))
+
+        self.set_view("hops")
+
+    def set_view(self, view):
+        self.view_var.set(view)
+        if view == "hops":
+            self.panel_title.configure(text="GROUP HOP DETECTIONS")
+            self._configure_hop_tree()
+            self.refresh_hop_table()
         else:
-            self._build_world_view()
-        self._update_mode_buttons()
+            self.panel_title.configure(text="OSRS WORLD POPULATIONS")
+            self._configure_world_tree()
+            self.refresh_world_table()
 
-    def _update_mode_buttons(self):
-        if self.mode.get() == "hops":
-            self.hop_btn.configure(style="Accent.TButton")
-            self.world_btn.configure(style="TButton")
-        else:
-            self.world_btn.configure(style="Accent.TButton")
-            self.hop_btn.configure(style="TButton")
+    def _configure_hop_tree(self):
+        columns = ("from", "to", "left", "appeared", "moved", "confidence", "detected")
+        self.tree["columns"] = columns
+        headings = {
+            "from": "FROM WORLD",
+            "to": "TO WORLD",
+            "left": "PLAYERS LEFT",
+            "appeared": "PLAYERS APPEARED",
+            "moved": "PLAYERS MOVED (EST.)",
+            "confidence": "SAME-GROUP LIKELIHOOD",
+            "detected": "DETECTED",
+        }
+        widths = {"from": 105, "to": 105, "left": 120, "appeared": 140,
+                  "moved": 145, "confidence": 180, "detected": 145}
+        for col in columns:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col], anchor="center", stretch=True)
 
-    def toggle_f2p(self):
-        # Changing the population universe invalidates the previous baseline.
-        # Reset it so toggling F2P cannot create a fake group hop.
-        self.previous = None
-        self.status.set("F2P filter changed — rebuilding baseline…")
-        self.render_worlds()
-        self.render_hops()
-        self.refresh_async()
+    def _configure_world_tree(self):
+        columns = ("world", "players", "location", "type", "activity")
+        self.tree["columns"] = columns
+        headings = {
+            "world": "WORLD", "players": "PLAYERS", "location": "LOCATION",
+            "type": "TYPE", "activity": "ACTIVITY"
+        }
+        widths = {"world": 90, "players": 120, "location": 180, "type": 110, "activity": 260}
+        for col in columns:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col], anchor="center" if col != "activity" else "w",
+                             stretch=True)
 
-    def _build_world_view(self):
-        self._clear_body()
-        main = self.panel(self.body)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
-        main.rowconfigure(1, weight=1)
-        title = "WORLD POPULATIONS" + ("  •  F2P INCLUDED" if self.include_f2p.get() else "  •  MEMBERS ONLY")
-        ttk.Label(main, text=title, style="Heading.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
-        frame = ttk.Frame(main)
-        frame.grid(row=1, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        self.world_tree = ttk.Treeview(frame, columns=("world", "players", "change", "location", "type", "activity"), show="headings")
-        for key, title, width in [("world", "WORLD", 90), ("players", "PLAYERS", 120), ("change", "CHANGE", 110), ("location", "LOCATION", 170), ("type", "TYPE", 100), ("activity", "ACTIVITY", 400)]:
-            self.world_tree.heading(key, text=title)
-            self.world_tree.column(key, width=width, anchor="center", stretch=key == "activity")
-        self.world_tree.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.world_tree.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.world_tree.configure(yscrollcommand=scroll.set)
-        self.world_tree.tag_configure("up", foreground="#67df76")
-        self.world_tree.tag_configure("down", foreground="#ff5757")
-        self.render_worlds()
+    def visible_worlds(self):
+        if self.f2p_var.get():
+            return self.worlds
+        return [w for w in self.worlds if w.membership == "Members"]
 
-    def render_worlds(self):
-        if not hasattr(self, "world_tree") or not self.world_tree.winfo_exists():
-            return
-        for item in self.world_tree.get_children():
-            self.world_tree.delete(item)
-        visible = filtered_worlds(self.current, self.include_f2p.get())
-        for wid, world in sorted(visible.items()):
-            old = self.previous.get(wid).players if self.previous and wid in self.previous else world.players
-            delta = world.players - old
-            tag = "up" if delta > 0 else "down" if delta < 0 else ""
-            self.world_tree.insert("", "end", values=(wid, f"{world.players:,}", f"{delta:+,}", world.location, world.membership, world.activity or "-"), tags=(tag,))
+    def on_filter_changed(self):
+        self.reset_baseline()
+        self.refresh_world_table()
+        self.refresh_hop_table()
 
-    def render_hops(self):
-        if not hasattr(self, "tree") or not self.tree.winfo_exists():
-            return
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        hops = self.history if self.keep_history.get() else self.history[-20:]
-        for hop in reversed(hops):
-            if self.only_likely.get() and hop.confidence < self.minimum_confidence.get():
-                continue
-            tag = "very" if hop.confidence >= 90 else "likely" if hop.confidence >= 75 else "possible"
-            when = time.strftime("%H:%M:%S", time.localtime(hop.timestamp))
-            self.tree.insert("", "end", values=(hop.source, hop.destination, f"-{hop.players_left}", f"+{hop.players_appeared}", f"~{hop.players_moved}", f"{hop.confidence}%", when), tags=(tag,))
+    def reset_baseline(self):
+        self.previous_snapshot = None
+        self.baseline_ready = False
+        self.detail_var.set("Baseline reset. Waiting for the next world snapshot.")
 
-    def show_detail(self, _event=None):
-        if not hasattr(self, "tree"):
-            return
-        sel = self.tree.selection()
-        if not sel:
-            return
-        vals = self.tree.item(sel[0], "values")
-        self.detail.config(text=(f"World {vals[0]} → World {vals[1]}   |   {vals[2]} players left World {vals[0]}   |   "
-                                f"{vals[3]} players appeared in World {vals[1]}   |   Estimated {vals[4].lstrip('~')} players moved   |   "
-                                f"{vals[5]} likelihood that this is the same group."))
+    def manual_refresh(self):
+        if not self.refresh_btn.instate(["disabled"]):
+            self.start_refresh()
 
-    def clear_history(self):
-        self.history.clear()
-        self.render_hops()
-        if hasattr(self, "detail"):
-            self.detail.config(text="Detection history cleared.")
-
-    def refresh_async(self):
-        if self.fetching:
-            return
-        self.fetching = True
-        self.status.set("Updating worlds…")
+    def start_refresh(self):
+        self.refresh_btn.state(["disabled"])
+        self.status_var.set("Updating worlds…")
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
     def _fetch_worker(self):
         try:
             worlds = fetch_worlds()
-            self.root.after(0, lambda: self._apply_snapshot(worlds))
+            self.root.after(0, lambda: self._apply_worlds(worlds))
         except Exception as exc:
-            self.root.after(0, lambda e=str(exc): self._fetch_failed(e))
-        finally:
-            self.root.after(0, self._fetch_finished)
-
-    def _fetch_finished(self):
-        self.fetching = False
-        if self.running:
-            self.root.after(POLL_SECONDS * 1000, self.refresh_async)
-
-    def _apply_snapshot(self, worlds):
-        current = filtered_worlds(worlds, self.include_f2p.get())
-        if self.previous is not None:
-            hops = detect_hops(self.previous, current, self.minimum_group.get(), self.minimum_confidence.get())
-            if hops:
-                self.history.extend(hops)
-                if self.notifications.get():
-                    try:
-                        self.root.bell()
-                    except tk.TclError:
-                        pass
-        self.current = current
-        self.previous = dict(current)
-        self.updated.set(time.strftime("Last update %H:%M:%S"))
-        count = len(current)
-        self.status.set(f"Tracking {count} worlds")
-        self.render_worlds()
-        self.render_hops()
+            self.root.after(0, lambda: self._fetch_failed(str(exc)))
 
     def _fetch_failed(self, error):
-        self.status.set("World update failed — retrying…")
-        if hasattr(self, "detail"):
-            self.detail.config(text=f"Could not update the OSRS world list: {error}")
+        self.refresh_btn.state(["!disabled"])
+        self.status_var.set("Update failed — retrying in 10 seconds")
+        if self.baseline_ready:
+            self.detail_var.set("World-list update failed: " + error)
+
+        self.root.after(POLL_SECONDS * 1000, self.start_refresh)
+
+    def _apply_worlds(self, worlds):
+        self.worlds = worlds
+        now = time.time()
+
+        visible = self.visible_worlds()
+        current = {w.world: w for w in visible}
+
+        if self.previous_snapshot is None:
+            self.previous_snapshot = current
+            self.baseline_ready = True
+        else:
+            hops = detect_hops(self.previous_snapshot, current, self.min_group_var.get())
+            min_conf = self.min_conf_var.get()
+
+            for hop in hops:
+                if hop.confidence >= min_conf:
+                    self.history.insert(0, hop)
+
+            if len(self.history) > 250:
+                self.history = self.history[:250]
+
+            self.previous_snapshot = current
+
+        self.last_update = now
+        self.refresh_btn.state(["!disabled"])
+
+        shown = "F2P + Members" if self.f2p_var.get() else "Members only"
+        self.status_var.set(
+            f"Updated {time.strftime('%H:%M:%S')}  •  {len(visible)} worlds  •  {shown}"
+        )
+
+        if self.view_var.get() == "hops":
+            self.refresh_hop_table()
+        else:
+            self.refresh_world_table()
+
+        self.root.after(POLL_SECONDS * 1000, self.start_refresh)
+
+    def refresh_world_table(self):
+        if self.view_var.get() != "worlds":
+            return
+        self.tree.delete(*self.tree.get_children())
+        for world in self.visible_worlds():
+            self.tree.insert(
+                "", "end",
+                values=(
+                    world.world,
+                    f"{world.players:,}",
+                    world.location,
+                    world.membership,
+                    world.activity,
+                )
+            )
+
+    def refresh_hop_table(self):
+        if self.view_var.get() != "hops":
+            return
+        self.tree.delete(*self.tree.get_children())
+
+        min_conf = self.min_conf_var.get()
+        for hop in self.history:
+            if hop.confidence < min_conf:
+                continue
+            self.tree.insert(
+                "", "end",
+                iid=f"{hop.timestamp}-{hop.source}-{hop.destination}",
+                values=(
+                    hop.source,
+                    hop.destination,
+                    f"{hop.players_left:,}",
+                    f"{hop.players_appeared:,}",
+                    f"{hop.players_moved:,}",
+                    f"{hop.confidence}%",
+                    time.strftime("%H:%M:%S", time.localtime(hop.timestamp)),
+                )
+            )
+
+        if not self.history:
+            self.detail_var.set(
+                "Waiting for a population change large enough to produce a detection."
+            )
+
+    def on_tree_select(self, _event):
+        if self.view_var.get() != "hops":
+            return
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        try:
+            ts, source, destination = selected[0].split("-")
+            ts = float(ts)
+            source = int(source)
+            destination = int(destination)
+        except ValueError:
+            return
+
+        hop = next(
+            (h for h in self.history
+             if h.timestamp == ts and h.source == source and h.destination == destination),
+            None
+        )
+        if not hop:
+            return
+
+        label = (
+            f"World {hop.source} → World {hop.destination}    •    "
+            f"{hop.players_left:,} players left World {hop.source}    •    "
+            f"{hop.players_appeared:,} appeared in World {hop.destination}    •    "
+            f"Estimated {hop.players_moved:,} players moved    •    "
+            f"{hop.confidence}% same-group likelihood"
+        )
+        self.detail_var.set(label)
+
+    def clear_history(self):
+        self.history.clear()
+        self.detail_var.set("Detection history cleared.")
+        self.refresh_hop_table()
 
     def close(self):
         self.running = False
@@ -439,8 +626,8 @@ class App:
 
 
 def main():
-    root = Tk()
-    App(root)
+    root = tk.Tk()
+    WorldTrackerApp(root)
     root.mainloop()
 
 
