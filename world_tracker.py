@@ -1,4 +1,4 @@
-import html, re, threading, time, urllib.request
+import html, re, threading, time, urllib.request, statistics
 from dataclasses import dataclass
 from html.parser import HTMLParser
 import tkinter as tk
@@ -6,6 +6,8 @@ from tkinter import ttk
 
 SOURCE_URL = "https://oldschool.runescape.com/slu"
 INTERVAL = 10
+EVENT_WINDOW = 30          # allow the public world list to lag by a couple of polls
+HISTORY_SIZE = 4
 APP_NAME = "Cake Powder / Faithful Few – OSRS World Tracker"
 
 
@@ -30,7 +32,12 @@ class Hop:
 
 
 class WorldParser(HTMLParser):
-    """Parse world rows and read the real world from slu-world-XXX."""
+    """Read the actual game world number from the world-list link.
+
+    Jagex's public HTML can display a short list number while the actual
+    game-launch link contains world=301, world=302, etc. We prefer the
+    href/query value, then fall back to the slu-world-XXX id.
+    """
     def __init__(self):
         super().__init__()
         self.in_row = False
@@ -50,13 +57,26 @@ class WorldParser(HTMLParser):
             self.cell_buf = []
             self.row = []
             self.world_id = None
+            return
 
-        elif self.in_row and tag in ("td", "th"):
+        if not self.in_row:
+            return
+
+        if tag in ("td", "th"):
             self.in_cell = True
             self.cell_buf = []
+            return
 
-        elif self.in_row and tag == "a":
+        if tag == "a":
             ident = attrs.get("id", "")
+            href = attrs.get("href", "")
+
+            # Most reliable: game?world=301
+            match = re.search(r"(?:[?&]world=|slu-world-)(\d+)", href)
+            if match:
+                self.world_id = int(match.group(1))
+                return
+
             match = re.fullmatch(r"slu-world-(\d+)", ident)
             if match:
                 self.world_id = int(match.group(1))
@@ -92,8 +112,8 @@ def fetch_worlds():
     req = urllib.request.Request(
         SOURCE_URL,
         headers={
-            "User-Agent": "CakePowder-OSRS-World-Tracker/5.0"
-        },
+            "User-Agent": "CakePowder-OSRS-World-Tracker/6.0"
+        }
     )
 
     with urllib.request.urlopen(req, timeout=15) as response:
@@ -120,7 +140,6 @@ def fetch_worlds():
         )
 
         membership = row[3]
-
         if membership not in ("Members", "Free"):
             continue
 
@@ -135,9 +154,7 @@ def fetch_worlds():
         )
 
     if not worlds:
-        raise RuntimeError(
-            "No OSRS worlds found in the server list."
-        )
+        raise RuntimeError("No OSRS worlds found in the server list.")
 
     unique = {world.world: world for world in worlds}
 
@@ -147,78 +164,182 @@ def fetch_worlds():
     )
 
 
-def detect_hops(prev, cur, min_group):
-    drops = []
-    gains = []
+def _deltas(old, new):
+    """Return signed player changes for worlds present in both snapshots."""
+    return {
+        world: new[world].players - old[world].players
+        for world in set(old) & set(new)
+    }
 
-    for world in set(prev) & set(cur):
-        delta = cur[world].players - prev[world].players
 
-        if delta <= -min_group:
-            drops.append((world, -delta))
-        elif delta >= min_group:
-            gains.append((world, delta))
+def _event_candidates(history, current, min_group):
+    """Build departure/arrival candidates using the newest snapshot plus
+    one older snapshot.
 
-    if not drops or not gains:
+    The important change from the old detector is that a group is not
+    required to appear as a perfect +/-6 in one exact 10-second sample.
+    The public world list can move in small increments or lag. We therefore
+    also examine a 20-second window and keep the newest event timestamp.
+    """
+    if not history:
         return []
 
-    total_left = sum(x[1] for x in drops)
-    total_appeared = sum(x[1] for x in gains)
+    newest = history[-1]
+    newest_map = newest[1]
 
-    results = []
-    used_destinations = set()
+    candidates = []
 
-    for source, left in sorted(
-        drops,
-        key=lambda x: x[1],
-        reverse=True
-    ):
-        best = None
+    # Always inspect the normal 10-second delta.
+    comparisons = [(history[-2] if len(history) >= 2 else None, newest)]
 
-        for destination, appeared in gains:
-            if destination in used_destinations:
-                continue
+    # Also inspect up to 20 seconds. This catches a group whose population
+    # change is split across two public-list updates.
+    if len(history) >= 3:
+        comparisons.append((history[-3], newest))
 
-            ratio = min(left, appeared) / max(left, appeared)
-            share = (
-                left / total_left +
-                appeared / total_appeared
-            ) / 2
+    for old_item, new_item in comparisons:
+        if old_item is None:
+            continue
 
-            score = 55 * ratio + 45 * share
+        old_time, old_map = old_item
+        new_time, new_map = new_item
+        age = new_time - old_time
 
-            # Small proximity bonus only.
-            # PK groups can hop to any world.
-            distance = abs(source - destination)
+        if age > EVENT_WINDOW:
+            continue
 
-            if distance == 1:
-                score += 6
-            elif distance <= 3:
-                score += 4
-            elif distance <= 10:
-                score += 2
+        deltas = _deltas(old_map, new_map)
 
-            if best is None or score > best[0]:
-                best = (score, destination, appeared)
+        # Estimate ordinary world-list noise. A median is much less affected
+        # by a handful of real group hops.
+        abs_changes = [
+            abs(v) for v in deltas.values()
+            if abs(v) > 0
+        ]
+        noise = statistics.median(abs_changes) if abs_changes else 1.0
 
-        if best:
-            score, destination, appeared = best
-            confidence = min(99, round(score))
+        drops = [
+            (world, -delta)
+            for world, delta in deltas.items()
+            if delta <= -min_group
+        ]
+        gains = [
+            (world, delta)
+            for world, delta in deltas.items()
+            if delta >= min_group
+        ]
 
-            if confidence >= 50:
-                results.append(
-                    Hop(
-                        source=source,
-                        destination=destination,
-                        left=left,
-                        appeared=appeared,
-                        moved=min(left, appeared),
-                        confidence=confidence,
-                        timestamp=time.time(),
+        if not drops or not gains:
+            continue
+
+        for source, left in drops:
+            for destination, appeared in gains:
+                moved = min(left, appeared)
+
+                # Exact population matching is the strongest signal.
+                ratio = min(left, appeared) / max(left, appeared)
+
+                # How large is this movement compared with normal noise?
+                signal = min(
+                    1.0,
+                    moved / max(float(min_group), noise * 2.0)
+                )
+
+                # If there are dozens of candidate movements, matching one
+                # pair is less informative than when only a few exist.
+                candidate_count = len(drops) + len(gains)
+                uniqueness = 1.0 / (
+                    1.0 + max(0, candidate_count - 2) * 0.18
+                )
+
+                # World-number proximity is deliberately only a small bonus.
+                # PK groups can and do hop anywhere.
+                distance = abs(source - destination)
+                if distance == 1:
+                    proximity = 1.0
+                elif distance <= 3:
+                    proximity = 0.75
+                elif distance <= 10:
+                    proximity = 0.45
+                elif distance <= 25:
+                    proximity = 0.20
+                else:
+                    proximity = 0.0
+
+                # Longer comparison windows are useful for laggy public data,
+                # but a direct 10-second match is slightly stronger.
+                timing = 1.0 if age <= 11.5 else 0.65
+
+                score = (
+                    ratio * 48.0 +
+                    signal * 22.0 +
+                    uniqueness * 12.0 +
+                    proximity * 8.0 +
+                    timing * 10.0
+                )
+
+                confidence = min(99, round(score))
+
+                candidates.append(
+                    (
+                        confidence,
+                        source,
+                        destination,
+                        left,
+                        appeared,
+                        moved,
+                        new_time
                     )
                 )
 
-                used_destinations.add(destination)
+    # Highest-confidence candidates first; one destination is only used once
+    # per polling cycle.
+    candidates.sort(reverse=True)
+
+    results = []
+    used_sources = set()
+    used_destinations = set()
+
+    # Avoid generating the same event twice from the 10s and 20s comparisons.
+    recent_keys = set()
+
+    for (
+        confidence,
+        source,
+        destination,
+        left,
+        appeared,
+        moved,
+        timestamp
+    ) in candidates:
+        key = (source, destination, round(timestamp / INTERVAL))
+
+        if key in recent_keys:
+            continue
+
+        if source in used_sources or destination in used_destinations:
+            continue
+
+        # Keep low-confidence observations out of the event stream. The UI's
+        # minimum-confidence setting still controls what the user sees.
+        if confidence < 50:
+            continue
+
+        results.append(
+            Hop(
+                source=source,
+                destination=destination,
+                left=left,
+                appeared=appeared,
+                moved=moved,
+                confidence=confidence,
+                timestamp=timestamp,
+            )
+        )
+
+        used_sources.add(source)
+        used_destinations.add(destination)
+        recent_keys.add(key)
 
     return results
 
@@ -232,9 +353,7 @@ class GroupChain:
     @property
     def size(self):
         recent = self.hops[-5:]
-        return round(
-            sum(h.moved for h in recent) / len(recent)
-        )
+        return round(sum(h.moved for h in recent) / len(recent))
 
     @property
     def confidence(self):
@@ -257,16 +376,18 @@ class GroupChain:
         else:
             consistency = 0
 
+        # Repeated hops are a strong signal. Three consistent hops should
+        # become very hard to dismiss as random movement.
         repeat_bonus = min(
-            12,
-            (len(self.hops) - 1) * 4
+            18,
+            (len(self.hops) - 1) * 6
         )
 
         return min(
             99,
             round(
-                avg * 0.78 +
-                consistency * 18 +
+                avg * 0.72 +
+                consistency * 20 +
                 repeat_bonus
             )
         )
@@ -285,12 +406,14 @@ class GroupChain:
         if not self.size:
             return False
 
-        if abs(hop.moved - self.size) / self.size > 0.35:
+        # Allow modest real-world population noise. For a six-player group,
+        # 4-8 is still a sensible continuation.
+        tolerance = max(3, round(self.size * 0.45))
+
+        if abs(hop.moved - self.size) > tolerance:
             return False
 
-        return (
-            hop.timestamp - self.last_time <= 45
-        )
+        return hop.timestamp - self.last_time <= 60
 
     def add(self, hop):
         self.hops.append(hop)
@@ -307,19 +430,18 @@ class App:
 
         self.worlds = []
         self.previous = None
+        self.snapshot_history = []
         self.hops = []
         self.chains = []
+        self.seen_events = {}
 
         self.f2p = tk.BooleanVar(value=False)
-        self.min_group = tk.IntVar(value=10)
-        self.min_conf = tk.IntVar(value=75)
+        self.min_group = tk.IntVar(value=5)
+        self.min_conf = tk.IntVar(value=60)
 
         self.view = "hops"
 
-        self.status = tk.StringVar(
-            value="Starting…"
-        )
-
+        self.status = tk.StringVar(value="Starting…")
         self.detail = tk.StringVar(
             value="Waiting for first snapshot."
         )
@@ -334,10 +456,7 @@ class App:
         root.after(100, self.refresh)
 
     def build_ui(self):
-        header = ttk.Frame(
-            self.root,
-            padding=16
-        )
+        header = ttk.Frame(self.root, padding=16)
         header.pack(fill="x")
 
         ttk.Label(
@@ -390,7 +509,7 @@ class App:
 
         ttk.Label(
             toolbar,
-            text="10-second detection window"
+            text="10-second detection window • 20-second confirmation"
         ).pack(side="right")
 
         body = ttk.Frame(self.root)
@@ -447,9 +566,10 @@ class App:
         ttk.Label(
             settings,
             text=(
-                "Group chains tolerate up to\n"
-                "35% size variation and remain\n"
-                "active for 45 seconds."
+                "10 seconds: direct detection\n"
+                "20 seconds: lag/partial-change check\n"
+                "Repeated hops strengthen a group chain.\n"
+                "World proximity is only a small bonus."
             ),
             justify="left"
         ).pack(
@@ -533,34 +653,19 @@ class App:
 
         columns = {
             "hops": (
-                "from",
-                "to",
-                "left",
-                "app",
-                "moved",
-                "conf",
-                "time"
+                "from", "to", "left", "app",
+                "moved", "conf", "time"
             ),
             "chains": (
-                "route",
-                "size",
-                "hops",
-                "conf",
-                "time"
+                "route", "size", "hops", "conf", "time"
             ),
             "worlds": (
-                "world",
-                "players",
-                "location",
-                "type",
-                "activity"
+                "world", "players", "location",
+                "type", "activity"
             ),
         }
 
-        self.view_title.config(
-            text=titles[view]
-        )
-
+        self.view_title.config(text=titles[view])
         self.tree["columns"] = columns[view]
 
         for column in columns[view]:
@@ -568,7 +673,6 @@ class App:
                 column,
                 text=column.upper()
             )
-
             self.tree.column(
                 column,
                 width=120,
@@ -576,22 +680,14 @@ class App:
             )
 
         if view == "worlds":
-            self.tree.column(
-                "location",
-                width=180
-            )
-
+            self.tree.column("location", width=180)
             self.tree.column(
                 "activity",
                 width=260,
                 anchor="w"
             )
-
         elif view == "chains":
-            self.tree.column(
-                "route",
-                width=280
-            )
+            self.tree.column("route", width=280)
 
         self.draw()
 
@@ -606,6 +702,8 @@ class App:
 
     def reset_baseline(self):
         self.previous = None
+        self.snapshot_history.clear()
+        self.seen_events.clear()
 
         self.detail.set(
             "Baseline reset; waiting for the next 10-second snapshot."
@@ -637,10 +735,7 @@ class App:
             )
 
     def fetch_failed(self, message):
-        self.status.set(
-            "Update failed; retrying…"
-        )
-
+        self.status.set("Update failed; retrying…")
         self.detail.set(
             f"Could not update world data: {message}"
         )
@@ -658,24 +753,57 @@ class App:
             for w in self.visible_worlds()
         }
 
+        now = time.time()
+
+        self.snapshot_history.append((now, current))
+        self.snapshot_history = self.snapshot_history[-HISTORY_SIZE:]
+
         if self.previous is None:
             self.previous = current
-
             self.detail.set(
                 "Baseline captured. Waiting for the next 10-second snapshot."
             )
-
         else:
-            for hop in detect_hops(
-                self.previous,
+            detected = _event_candidates(
+                self.snapshot_history,
                 current,
                 self.min_group.get()
-            ):
+            )
+
+            added = 0
+
+            for hop in detected:
+                # De-duplicate events generated from overlapping windows.
+                event_key = (
+                    hop.source,
+                    hop.destination,
+                    round(hop.timestamp / INTERVAL)
+                )
+
+                if event_key in self.seen_events:
+                    continue
+
+                self.seen_events[event_key] = hop.timestamp
+
                 if hop.confidence >= self.min_conf.get():
                     self.hops.insert(0, hop)
                     self.update_chain(hop)
+                    added += 1
+
+            # Keep the de-duplication table small.
+            cutoff = now - 180
+            self.seen_events = {
+                k: v for k, v in self.seen_events.items()
+                if v >= cutoff
+            }
 
             self.previous = current
+
+            if added:
+                self.detail.set(
+                    f"Detected {added} possible group hop"
+                    f"{'s' if added != 1 else ''}."
+                )
 
         self.status.set(
             f"Updated {time.strftime('%H:%M:%S')} • "
@@ -701,13 +829,11 @@ class App:
                 candidates,
                 key=lambda c: abs(c.size - hop.moved)
             ).add(hop)
-
         else:
             self.chains.insert(
                 0,
                 GroupChain(hop)
             )
-
             self.chains = self.chains[:50]
 
     def draw(self):
@@ -716,11 +842,8 @@ class App:
         )
 
         if self.view == "hops":
-
             for hop in self.hops:
-
                 if hop.confidence >= self.min_conf.get():
-
                     self.tree.insert(
                         "",
                         "end",
@@ -733,50 +856,38 @@ class App:
                             f"{hop.confidence}%",
                             time.strftime(
                                 "%H:%M:%S",
-                                time.localtime(
-                                    hop.timestamp
-                                )
+                                time.localtime(hop.timestamp)
                             ),
                         )
                     )
 
         elif self.view == "chains":
-
             now = time.time()
 
             self.chains = [
                 c for c in self.chains
-                if now - c.last_time <= 45
+                if now - c.last_time <= 60
             ]
 
-            for index, chain in enumerate(
-                self.chains
-            ):
-
+            for index, chain in enumerate(self.chains):
                 self.tree.insert(
                     "",
                     "end",
                     iid=f"c{index}",
                     values=(
-                        " → ".join(
-                            map(str, chain.route)
-                        ),
+                        " → ".join(map(str, chain.route)),
                         f"~{chain.size}",
                         len(chain.hops),
                         f"{chain.confidence}%",
                         time.strftime(
                             "%H:%M:%S",
-                            time.localtime(
-                                chain.last_time
-                            )
-                        ),
+                            time.localtime(chain.last_time)
+                        )
                     )
                 )
 
         else:
-
             for world in self.visible_worlds():
-
                 self.tree.insert(
                     "",
                     "end",
@@ -796,10 +907,7 @@ class App:
             return
 
         if self.view == "chains":
-
-            chain = self.chains[
-                int(selection[0][1:])
-            ]
+            chain = self.chains[int(selection[0][1:])]
 
             self.detail.set(
                 f"Active group: ~{chain.size} players • "
@@ -809,7 +917,6 @@ class App:
             )
 
         elif self.view == "hops":
-
             values = self.tree.item(
                 selection[0],
                 "values"
@@ -825,11 +932,9 @@ class App:
     def clear_history(self):
         self.hops.clear()
         self.chains.clear()
+        self.seen_events.clear()
 
-        self.detail.set(
-            "History cleared."
-        )
-
+        self.detail.set("History cleared.")
         self.draw()
 
 
