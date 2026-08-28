@@ -316,8 +316,67 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_NAME)
-        root.geometry("1250x760")
-        root.minsize(1000, 650)
+        root.geometry("1350x800")
+        root.minsize(1100, 700)
+        root.configure(bg="#0b1018")
+
+        style = ttk.Style(root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("TFrame", background="#0b1018")
+        style.configure("TLabel", background="#0b1018", foreground="#e7edf6",
+                        font=("Segoe UI", 9))
+        style.configure("Header.TLabel", background="#0b1018",
+                        foreground="#f4f7fb", font=("Segoe UI", 23, "bold"))
+        style.configure("Brand.TLabel", background="#0b1018",
+                        foreground="#9b6cff", font=("Segoe UI", 10, "bold"))
+        style.configure("Status.TLabel", background="#0b1018",
+                        foreground="#8d9ab0", font=("Segoe UI", 9))
+        style.configure("Title.TLabel", background="#0b1018",
+                        foreground="#b477ff", font=("Segoe UI", 11, "bold"))
+
+        style.configure("TLabelframe", background="#111927",
+                        foreground="#a970ff", bordercolor="#263247")
+        style.configure("TLabelframe.Label", background="#111927",
+                        foreground="#a970ff", font=("Segoe UI", 10, "bold"))
+
+        style.configure("TButton", background="#182235",
+                        foreground="#e7edf6", bordercolor="#2a3951",
+                        padding=(14, 7), font=("Segoe UI", 9, "bold"))
+        style.map("TButton",
+                  background=[("active", "#293953"), ("pressed", "#34476a")])
+
+        style.configure("Accent.TButton", background="#7c4dff",
+                        foreground="white", bordercolor="#7c4dff",
+                        padding=(16, 8), font=("Segoe UI", 9, "bold"))
+        style.map("Accent.TButton",
+                  background=[("active", "#966eff"), ("pressed", "#6938df")])
+
+        style.configure("TCheckbutton", background="#0b1018",
+                        foreground="#dce4f0", font=("Segoe UI", 9))
+        style.map("TCheckbutton", background=[("active", "#0b1018")])
+
+        style.configure("Modern.Treeview",
+                        background="#111927", fieldbackground="#111927",
+                        foreground="#e7edf6", rowheight=31,
+                        borderwidth=0, relief="flat",
+                        font=("Segoe UI", 9))
+        style.configure("Modern.Treeview.Heading",
+                        background="#182235", foreground="#d5ddeb",
+                        relief="flat", borderwidth=0, padding=(9, 9),
+                        font=("Segoe UI", 9, "bold"))
+        style.map("Modern.Treeview",
+                  background=[("selected", "#3d2875")],
+                  foreground=[("selected", "white")])
+        style.map("Modern.Treeview.Heading",
+                  background=[("active", "#24334b")])
+
+        style.configure("Modern.Vertical.TScrollbar",
+                        background="#182235", troughcolor="#0b1018",
+                        bordercolor="#0b1018", arrowcolor="#91a0b5")
 
         self.worlds = []
         self.previous = None
@@ -358,18 +417,19 @@ class App:
         ttk.Label(
             header,
             text="Cake Powder",
-            font=("Segoe UI", 20, "bold")
+            style="Header.TLabel"
         ).pack(side="left")
 
         ttk.Label(
             header,
             text="  /  FAITHFUL FEW",
-            font=("Segoe UI", 10, "bold")
+            style="Brand.TLabel"
         ).pack(side="left")
 
         ttk.Label(
             header,
-            textvariable=self.status
+            textvariable=self.status,
+            style="Status.TLabel"
         ).pack(side="right")
 
         toolbar = ttk.Frame(
@@ -381,18 +441,21 @@ class App:
         ttk.Button(
             toolbar,
             text="Worlds",
+            style="TButton",
             command=lambda: self.set_view("worlds")
         ).pack(side="left", padx=3)
 
         ttk.Button(
             toolbar,
             text="Group Hops",
+            style="TButton",
             command=lambda: self.set_view("hops")
         ).pack(side="left", padx=3)
 
         ttk.Button(
             toolbar,
             text="Active Groups",
+            style="TButton",
             command=lambda: self.set_view("chains")
         ).pack(side="left", padx=3)
 
@@ -424,7 +487,7 @@ class App:
         settings.pack(
             side="left",
             fill="y",
-            padx=(0, 12)
+            padx=(0, 14)
         )
 
         ttk.Label(
@@ -492,7 +555,7 @@ class App:
         self.view_title = ttk.Label(
             main,
             text="GROUP HOP DETECTIONS",
-            font=("Segoe UI", 10, "bold")
+            style="Title.TLabel"
         )
         self.view_title.pack(
             anchor="w",
