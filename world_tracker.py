@@ -567,6 +567,7 @@ class App:
                 "time"
             ),
             "chains": (
+                "status",
                 "route",
                 "size",
                 "hops",
@@ -586,12 +587,37 @@ class App:
             text=titles[view]
         )
 
+        self.detail.set({
+            "worlds": "Showing the current OSRS world population snapshot.",
+            "hops": "Showing individual 10-second population changes that look like group hops.",
+            "chains": "Showing persistent group identities remembered for up to 1 hour after their latest matching hop.",
+        }[view])
+
         self.tree["columns"] = columns[view]
+
+        heading_names = {
+            "from": "FROM WORLD",
+            "to": "TO WORLD",
+            "left": "PLAYERS LEFT",
+            "app": "PLAYERS APPEARED",
+            "moved": "PLAYERS MOVED",
+            "conf": "LIKELIHOOD",
+            "time": "LAST DETECTED",
+            "status": "STATUS",
+            "route": "GROUP ROUTE",
+            "size": "GROUP SIZE",
+            "hops": "HOPS",
+            "world": "WORLD",
+            "players": "PLAYERS",
+            "location": "LOCATION",
+            "type": "TYPE",
+            "activity": "ACTIVITY",
+        }
 
         for column in columns[view]:
             self.tree.heading(
                 column,
-                text=column.upper()
+                text=heading_names.get(column, column.upper())
             )
 
             self.tree.column(
@@ -601,20 +627,28 @@ class App:
             )
 
         if view == "worlds":
-            self.tree.column(
-                "location",
-                width=180
-            )
+            self.tree.column("world", width=90, anchor="center")
+            self.tree.column("players", width=110, anchor="center")
+            self.tree.column("location", width=180, anchor="center")
+            self.tree.column("type", width=110, anchor="center")
+            self.tree.column("activity", width=300, anchor="w")
 
-            self.tree.column(
-                "activity",
-                width=260,
-                anchor="w"
-            )
+        elif view == "hops":
+            self.tree.column("from", width=105, anchor="center")
+            self.tree.column("to", width=105, anchor="center")
+            self.tree.column("left", width=125, anchor="center")
+            self.tree.column("app", width=145, anchor="center")
+            self.tree.column("moved", width=125, anchor="center")
+            self.tree.column("conf", width=120, anchor="center")
+            self.tree.column("time", width=125, anchor="center")
 
         elif view == "chains":
-            self.tree.column("status", width=90)
-            self.tree.column("route", width=340)
+            self.tree.column("status", width=90, anchor="center")
+            self.tree.column("route", width=360, anchor="w")
+            self.tree.column("size", width=110, anchor="center")
+            self.tree.column("hops", width=90, anchor="center")
+            self.tree.column("conf", width=120, anchor="center")
+            self.tree.column("time", width=100, anchor="center")
 
         self.draw()
 
@@ -801,7 +835,7 @@ class App:
                     values=(
                         status,
                         " → ".join(map(str, chain.route)),
-                        f"~{chain.size}",
+                        f"~{chain.size} players",
                         chain.hop_count,
                         f"{chain.confidence}%",
                         time.strftime(
