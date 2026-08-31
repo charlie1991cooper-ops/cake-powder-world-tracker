@@ -24,6 +24,8 @@ INTERVAL = 2
 MOVEMENT_WINDOW = 10
 MAX_TRACKED_MOVEMENT = 400
 APP_NAME = "Cake's OSRS World Tracker"
+APP_PASSWORD = "1234"
+CONVERGENCE_WINDOW = 30
 DINK_HOST = "127.0.0.1"
 DINK_PORT = 8080
 DINK_PATH = "/dink"
@@ -195,13 +197,21 @@ def detect_hops(prev, cur, min_group, delta_history=None):
 
 
 def rolling_changes(snapshot_history, current, now, min_group):
+    """Find the strongest net population movement for each world over the
+    rolling movement window. Uses actual timestamps instead of a fixed number
+    of snapshots, so a slow 6-10 second movement can be recognised as one event.
+    """
     if not snapshot_history:
         return [], []
+
     cutoff = now - MOVEMENT_WINDOW
     prior = [(ts, snap) for ts, snap in snapshot_history if cutoff <= ts < now]
+    if not prior:
+        return [], []
+
     drops, gains = [], []
     for world, cur_world in current.items():
-        best = None
+        candidates = []
         for ts, snap in prior:
             old = snap.get(world)
             if old is None:
@@ -210,97 +220,87 @@ def rolling_changes(snapshot_history, current, now, min_group):
             magnitude = abs(delta)
             if magnitude < min_group or magnitude > MAX_TRACKED_MOVEMENT:
                 continue
-            rank = (magnitude, -(now - ts))
-            if best is None or rank > best[0]:
-                best = (rank, delta, ts)
-        if best is None:
+            # Prefer large genuine movement, but when equal prefer the most recent baseline.
+            candidates.append((magnitude, ts, delta))
+
+        if not candidates:
             continue
-        _, delta, start_time = best
-        change = Change(world, delta, start_time, now)
-        (drops if delta < 0 else gains).append(change)
+        magnitude, start_time, delta = max(candidates, key=lambda x: (x[0], x[1]))
+        drops.append(Change(world, delta, start_time, now)) if delta < 0 else gains.append(Change(world, delta, start_time, now))
+
     return drops, gains
 
 
-def detect_convergences(drops, gains, timestamp):
-    """Find multiple distinct source worlds moving toward the same destination
-    inside the rolling movement window.
+def detect_convergences(movement_history, timestamp, min_group):
+    """Detect multiple distinct source worlds converging on one destination.
 
-    This intentionally does NOT require source outflow to equal destination
-    inflow. Population snapshots can under-report/over-report the true group
-    size, so convergence is treated as a pattern rather than proof.
+    Normal hops use a 10-second window. Convergence is intentionally given a
+    30-second window because several source worlds can feed the same destination
+    over several polls. The result is evidence of a pattern, not proof that all
+    source losses reached the destination.
     """
+    cutoff = timestamp - CONVERGENCE_WINDOW
+    recent = [m for m in movement_history if m["time"] >= cutoff]
+    if not recent:
+        return []
+
+    drops_by_world = defaultdict(list)
+    gains_by_world = defaultdict(list)
+    for m in recent:
+        if abs(m["amount"]) > MAX_TRACKED_MOVEMENT:
+            continue
+        if m["amount"] <= -min_group:
+            drops_by_world[m["world"]].append(m)
+        elif m["amount"] >= min_group:
+            gains_by_world[m["world"]].append(m)
+
     results = []
-    for destination in gains:
+    for destination, gain_items in gains_by_world.items():
+        # Use the strongest recent destination gain as the destination signal.
+        dest = max(gain_items, key=lambda x: abs(x["amount"]))
         eligible = []
-        for source in drops:
-            if source.world == destination.world:
+        for source, source_items in drops_by_world.items():
+            if source == destination:
                 continue
-
-            ratio = ratio_score(source.magnitude, destination.magnitude)
-            if ratio <= 0:
+            src = max(source_items, key=lambda x: abs(x["amount"]))
+            age = abs(src["time"] - dest["time"])
+            if age > CONVERGENCE_WINDOW:
                 continue
-
-            timing = 1.0 - min(
-                abs(source.start_time - destination.start_time),
-                MOVEMENT_WINDOW
-            ) / MOVEMENT_WINDOW
-
-            # A source that happens in the same few seconds as the destination
-            # is much more useful than one near the edge of the window.
-            if timing < 0.30:
+            if abs(src["amount"]) < min_group:
                 continue
-
-            eligible.append((source, ratio, timing))
+            eligible.append((source, abs(src["amount"]), age, src["time"]))
 
         if len(eligible) < 2:
             continue
 
-        # Prefer the strongest, best-timed sources. Limit the pattern to the
-        # most useful sources so a noisy burst cannot grow without bound.
-        eligible.sort(
-            key=lambda item: (
-                item[1] * 0.70 + item[2] * 0.30,
-                item[0].magnitude
-            ),
-            reverse=True
-        )
+        # Keep the best evidence and cap the source count.
+        eligible.sort(key=lambda x: (-(x[1]), x[2]))
         chosen = eligible[:6]
+        sizes = [x[1] for x in chosen]
+        median_size = sorted(sizes)[len(sizes)//2]
+        consistency = 1.0 - (sum(abs(x - median_size) for x in sizes) / (sum(sizes) or 1))
+        consistency = max(0.0, min(1.0, consistency))
+        avg_age = sum(x[2] for x in chosen) / len(chosen)
+        timing = max(0.0, 1.0 - avg_age / CONVERGENCE_WINDOW)
+        source_bonus = min(28, (len(chosen) - 2) * 13)
+        size_bonus = min(8, max(0, median_size - min_group) * 0.25)
 
-        avg_ratio = sum(item[1] for item in chosen) / len(chosen)
-        avg_timing = sum(item[2] for item in chosen) / len(chosen)
-        source_bonus = min(24, (len(chosen) - 2) * 10)
-        size_bonus = min(12, max(0, destination.magnitude - 10) * 0.45)
-
-        score = (
-            43.0 * avg_ratio
-            + 24.0 * avg_timing
-            + source_bonus
-            + size_bonus
-        )
-
-        # If several sources each have a respectable match to the same
-        # destination, that's specifically interesting for PvP scouting.
+        score = 46 + 18 * timing + 16 * consistency + source_bonus + size_bonus
         if len(chosen) >= 3:
-            score += 10
+            score += 9
         if len(chosen) >= 4:
-            score += 7
+            score += 6
 
-        sources = tuple(item[0].world for item in chosen)
-        amounts = tuple(item[0].magnitude for item in chosen)
+        results.append(Convergence(
+            destination=destination,
+            sources=tuple(x[0] for x in chosen),
+            source_amounts=tuple(x[1] for x in chosen),
+            appeared=abs(dest["amount"]),
+            score=min(99, max(0, round(score))),
+            timestamp=timestamp,
+        ))
 
-        results.append(
-            Convergence(
-                destination=destination.world,
-                sources=sources,
-                source_amounts=amounts,
-                appeared=destination.magnitude,
-                score=min(99, max(0, round(score))),
-                timestamp=timestamp,
-            )
-        )
-
-    # Best convergence first. Only one pattern per destination per poll.
-    results.sort(key=lambda c: c.score, reverse=True)
+    results.sort(key=lambda c: (c.score, c.source_count), reverse=True)
     return results
 
 
@@ -527,6 +527,7 @@ class App:
         self.hops = []
         self.movements = []
         self.convergences = deque(maxlen=150)
+        self.movement_history = deque(maxlen=2000)
         self.chains = []
         self.alerts = deque(maxlen=250)
         self.max_chain_history = 150
@@ -973,7 +974,7 @@ class App:
 
     def reset_baseline(self):
         self.previous = None
-        self.detail.set("Baseline reset; waiting for the next 10-second snapshot.")
+        self.detail.set("Baseline reset; waiting for the next world snapshot.")
         self.draw()
 
     def set_view(self, view):
@@ -1023,7 +1024,7 @@ class App:
             "worlds": "Current official OSRS world population snapshot.",
             "hops": "Paired population drops and rises that are consistent with a group moving between worlds.",
             "chains": "Persistent inferred groups remembered for one hour after their latest matching hop. Routes may revisit worlds.",
-            "convergences": "Multiple different source worlds showing group-sized outflows toward the same destination inside the rolling 10-second window.",
+            "convergences": "Multiple source worlds showing group-sized outflows toward the same destination inside a rolling 30-second pattern window.",
             "alerts": "Unusual world-level population movements, including movements with no detectable source world.",
         }[view])
         self.draw()
@@ -1064,8 +1065,16 @@ class App:
         else:
             histories = self.delta_history
             drops, gains = rolling_changes(self.snapshot_history, current, now, self.min_group.get())
+
+            # Keep one rolling record per observed world movement. This is used
+            # for multi-world patterns over 30 seconds without treating every
+            # 2-second poll as a brand-new event.
+            for change in drops + gains:
+                self._record_movement_event(change, now)
+            self._prune_movement_history(now)
+
             hops = self.detect_with_pending(drops, gains, now, histories)
-            convergences = detect_convergences(drops, gains, now)
+            convergences = detect_convergences(self.movement_history, now, self.min_group.get())
             matched_worlds = {h.source for h in hops} | {h.destination for h in hops}
 
             for hop in hops:
@@ -1125,6 +1134,35 @@ class App:
         delay = max(700, int(INTERVAL * 1000 - elapsed * 1000))
         self.root.after(delay, self.refresh)
 
+    def _record_movement_event(self, change, now):
+        key = (change.world, "in" if change.amount > 0 else "out")
+        # Replace an existing same-sign event for this world when this poll has
+        # stronger evidence. This prevents repeatedly counting a continuing
+        # population shift as several independent source worlds.
+        for idx, item in enumerate(self.movement_history):
+            if item["key"] == key:
+                if abs(change.amount) >= abs(item["amount"]):
+                    self.movement_history[idx] = {
+                        "key": key,
+                        "world": change.world,
+                        "amount": change.amount,
+                        "time": now,
+                    }
+                return
+        self.movement_history.append({
+            "key": key,
+            "world": change.world,
+            "amount": change.amount,
+            "time": now,
+        })
+
+    def _prune_movement_history(self, now):
+        cutoff = now - CONVERGENCE_WINDOW
+        self.movement_history = deque(
+            (x for x in self.movement_history if x["time"] >= cutoff),
+            maxlen=2000,
+        )
+
     def hop_recently_reported(self, source, destination, now):
         key = (source, destination)
         cutoff = now - MOVEMENT_WINDOW
@@ -1141,7 +1179,7 @@ class App:
 
     def convergence_recently_reported(self, convergence, now):
         current_sources = frozenset(convergence.sources)
-        cutoff = now - MOVEMENT_WINDOW
+        cutoff = now - CONVERGENCE_WINDOW
         # Keep only recent convergence records and suppress the same destination
         # repeatedly firing while the same set of source worlds is still present.
         kept = deque(maxlen=self.convergences.maxlen)
@@ -1266,6 +1304,7 @@ class App:
         self.hops.clear()
         self.movements.clear()
         self.convergences.clear()
+        self.movement_history.clear()
         self.chains.clear()
         self.alerts.clear()
         self.last_alert_signature.clear()
@@ -1278,7 +1317,58 @@ class App:
         self.draw()
 
 
+class LoginDialog(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.result = False
+        self.title("Cake's OSRS World Tracker - Login")
+        self.geometry("380x190")
+        self.resizable(False, False)
+        self.configure(bg="#0b1018")
+        self.transient(master)
+        self.grab_set()
+
+        frame = ttk.Frame(self, padding=24)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Cake's OSRS World Tracker", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(frame, text="Password").pack(anchor="w", pady=(16, 5))
+
+        self.password = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=self.password, show="*")
+        entry.pack(fill="x")
+        entry.focus_set()
+        entry.bind("<Return>", lambda _e: self.submit())
+
+        self.error = tk.StringVar()
+        ttk.Label(frame, textvariable=self.error, foreground="#ff5964").pack(anchor="w", pady=(6, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right")
+        ttk.Button(buttons, text="Unlock", style="Accent.TButton", command=self.submit).pack(side="right", padx=(0, 8))
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+
+    def submit(self):
+        if self.password.get() == APP_PASSWORD:
+            self.result = True
+            self.destroy()
+        else:
+            self.password.set("")
+            self.error.set("Incorrect password.")
+
+    def cancel(self):
+        self.result = False
+        self.destroy()
+
+
 if __name__ == "__main__":
     root = tk.Tk()
-    App(root)
-    root.mainloop()
+    root.withdraw()
+    login = LoginDialog(root)
+    root.wait_window(login)
+    if login.result:
+        root.deiconify()
+        App(root)
+        root.mainloop()
+    else:
+        root.destroy()
