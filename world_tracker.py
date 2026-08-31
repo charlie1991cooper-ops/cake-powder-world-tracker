@@ -72,6 +72,24 @@ class Change:
         return abs(self.amount)
 
 
+@dataclass(frozen=True)
+class Convergence:
+    destination: int
+    sources: tuple
+    source_amounts: tuple
+    appeared: int
+    score: int
+    timestamp: float
+
+    @property
+    def source_count(self):
+        return len(self.sources)
+
+    @property
+    def total_outflow(self):
+        return sum(self.source_amounts)
+
+
 class WorldParser(HTMLParser):
     """Parse the official world list and use slu-world-XXX for the real ID."""
 
@@ -201,6 +219,89 @@ def rolling_changes(snapshot_history, current, now, min_group):
         change = Change(world, delta, start_time, now)
         (drops if delta < 0 else gains).append(change)
     return drops, gains
+
+
+def detect_convergences(drops, gains, timestamp):
+    """Find multiple distinct source worlds moving toward the same destination
+    inside the rolling movement window.
+
+    This intentionally does NOT require source outflow to equal destination
+    inflow. Population snapshots can under-report/over-report the true group
+    size, so convergence is treated as a pattern rather than proof.
+    """
+    results = []
+    for destination in gains:
+        eligible = []
+        for source in drops:
+            if source.world == destination.world:
+                continue
+
+            ratio = ratio_score(source.magnitude, destination.magnitude)
+            if ratio <= 0:
+                continue
+
+            timing = 1.0 - min(
+                abs(source.start_time - destination.start_time),
+                MOVEMENT_WINDOW
+            ) / MOVEMENT_WINDOW
+
+            # A source that happens in the same few seconds as the destination
+            # is much more useful than one near the edge of the window.
+            if timing < 0.30:
+                continue
+
+            eligible.append((source, ratio, timing))
+
+        if len(eligible) < 2:
+            continue
+
+        # Prefer the strongest, best-timed sources. Limit the pattern to the
+        # most useful sources so a noisy burst cannot grow without bound.
+        eligible.sort(
+            key=lambda item: (
+                item[1] * 0.70 + item[2] * 0.30,
+                item[0].magnitude
+            ),
+            reverse=True
+        )
+        chosen = eligible[:6]
+
+        avg_ratio = sum(item[1] for item in chosen) / len(chosen)
+        avg_timing = sum(item[2] for item in chosen) / len(chosen)
+        source_bonus = min(24, (len(chosen) - 2) * 10)
+        size_bonus = min(12, max(0, destination.magnitude - 10) * 0.45)
+
+        score = (
+            43.0 * avg_ratio
+            + 24.0 * avg_timing
+            + source_bonus
+            + size_bonus
+        )
+
+        # If several sources each have a respectable match to the same
+        # destination, that's specifically interesting for PvP scouting.
+        if len(chosen) >= 3:
+            score += 10
+        if len(chosen) >= 4:
+            score += 7
+
+        sources = tuple(item[0].world for item in chosen)
+        amounts = tuple(item[0].magnitude for item in chosen)
+
+        results.append(
+            Convergence(
+                destination=destination.world,
+                sources=sources,
+                source_amounts=amounts,
+                appeared=destination.magnitude,
+                score=min(99, max(0, round(score))),
+                timestamp=timestamp,
+            )
+        )
+
+    # Best convergence first. Only one pattern per destination per poll.
+    results.sort(key=lambda c: c.score, reverse=True)
+    return results
 
 
 def match_changes(drops, gains, timestamp, delta_history=None):
@@ -425,6 +526,7 @@ class App:
         self.previous = None
         self.hops = []
         self.movements = []
+        self.convergences = deque(maxlen=150)
         self.chains = []
         self.alerts = deque(maxlen=250)
         self.max_chain_history = 150
@@ -449,13 +551,13 @@ class App:
         self.load_watched_players()
         self.dink_server = None
         self.dink_thread = None
-        self.min_group = tk.IntVar(value=5)
+        self.min_group = tk.IntVar(value=10)
         self.min_conf = tk.IntVar(value=50)
-        self.min_world_move = tk.IntVar(value=5)
+        self.min_world_move = tk.IntVar(value=10)
         self.watch_enabled = tk.BooleanVar(value=False)
         self.watch_world = tk.StringVar(value="")
-        self.watch_threshold = tk.IntVar(value=5)
-        self.sound_alerts = tk.BooleanVar(value=True)
+        self.watch_threshold = tk.IntVar(value=10)
+        self.sound_alerts = tk.BooleanVar(value=False)
 
         self.view = "hops"
         self.status = tk.StringVar(value="Starting…")
@@ -703,7 +805,13 @@ class App:
 
         toolbar = ttk.Frame(self.root, padding=(18, 0, 18, 12))
         toolbar.pack(fill="x")
-        for text, view in (("Worlds", "worlds"), ("Group Hops", "hops"), ("Active Groups", "chains"), ("World Alerts", "alerts")):
+        for text, view in (
+            ("Worlds", "worlds"),
+            ("Group Hops", "hops"),
+            ("Active Groups", "chains"),
+            ("Convergences", "convergences"),
+            ("World Alerts", "alerts"),
+        ):
             ttk.Button(toolbar, text=text, command=lambda v=view: self.set_view(v)).pack(side="left", padx=3)
         ttk.Checkbutton(toolbar, text="Include F2P worlds", variable=self.f2p, command=self.reset_baseline).pack(side="left", padx=18)
         ttk.Button(toolbar, text="Refresh Now", style="Accent.TButton", command=self.refresh).pack(side="right", padx=3)
@@ -873,12 +981,14 @@ class App:
         titles = {
             "hops": "GROUP HOP DETECTIONS",
             "chains": "ACTIVE GROUPS / 1 HOUR MEMORY",
+            "convergences": "MULTI-WORLD CONVERGENCES",
             "worlds": "OSRS WORLD POPULATIONS",
             "alerts": "WORLD MOVEMENT ALERTS",
         }
         columns = {
             "hops": ("from", "to", "left", "app", "moved", "likelihood", "time"),
             "chains": ("status", "route", "size", "hops", "likelihood", "time"),
+            "convergences": ("sources", "to", "appeared", "outflow", "likelihood", "time"),
             "worlds": ("world", "players", "location", "type", "activity"),
             "alerts": ("world", "movement", "change", "likelihood", "time", "reason"),
         }
@@ -888,8 +998,8 @@ class App:
             "from": "FROM", "to": "TO", "left": "LEFT", "app": "APPEARED", "moved": "EST. GROUP",
             "likelihood": "LIKELIHOOD", "time": "TIME", "status": "STATUS", "route": "GROUP ROUTE",
             "size": "GROUP SIZE", "hops": "HOPS", "world": "WORLD", "players": "PLAYERS",
-            "location": "LOCATION", "type": "TYPE", "activity": "ACTIVITY", "movement": "MOVEMENT",
-            "change": "CHANGE", "reason": "REASON",
+            "sources": "SOURCE WORLDS", "location": "LOCATION", "type": "TYPE", "activity": "ACTIVITY",
+            "movement": "MOVEMENT", "change": "CHANGE", "reason": "REASON",
         }
         for col in columns[view]:
             self.tree.heading(col, text=names[col])
@@ -899,6 +1009,9 @@ class App:
                 self.tree.column(col, width=width)
         elif view == "chains":
             for col, width in (("status", 90), ("route", 420), ("size", 110), ("hops", 80), ("likelihood", 125), ("time", 95)):
+                self.tree.column(col, width=width)
+        elif view == "convergences":
+            for col, width in (("sources", 300), ("to", 85), ("appeared", 105), ("outflow", 120), ("likelihood", 125), ("time", 95)):
                 self.tree.column(col, width=width)
         elif view == "worlds":
             for col, width in (("world", 85), ("players", 110), ("location", 180), ("type", 100), ("activity", 360)):
@@ -910,6 +1023,7 @@ class App:
             "worlds": "Current official OSRS world population snapshot.",
             "hops": "Paired population drops and rises that are consistent with a group moving between worlds.",
             "chains": "Persistent inferred groups remembered for one hour after their latest matching hop. Routes may revisit worlds.",
+            "convergences": "Multiple different source worlds showing group-sized outflows toward the same destination inside the rolling 10-second window.",
             "alerts": "Unusual world-level population movements, including movements with no detectable source world.",
         }[view])
         self.draw()
@@ -931,6 +1045,10 @@ class App:
         self.root.after(int(INTERVAL * 1000), self.refresh)
 
     def apply_worlds(self, worlds):
+        # Clamp user-editable thresholds to the supported range.
+        self.min_group.set(min(MAX_TRACKED_MOVEMENT, max(1, self.min_group.get())))
+        self.min_world_move.set(min(MAX_TRACKED_MOVEMENT, max(1, self.min_world_move.get())))
+        self.watch_threshold.set(min(MAX_TRACKED_MOVEMENT, max(1, self.watch_threshold.get())))
         self.fetch_in_progress = False
         self.fetch_failures = 0
         self.worlds = worlds
@@ -947,12 +1065,33 @@ class App:
             histories = self.delta_history
             drops, gains = rolling_changes(self.snapshot_history, current, now, self.min_group.get())
             hops = self.detect_with_pending(drops, gains, now, histories)
+            convergences = detect_convergences(drops, gains, now)
             matched_worlds = {h.source for h in hops} | {h.destination for h in hops}
 
             for hop in hops:
                 if hop.score >= self.min_conf.get():
                     self.hops.insert(0, hop)
                     self.update_chain(hop)
+
+            # Convergence is a separate pattern: multiple source worlds
+            # feeding one destination in the same rolling window.
+            for convergence in convergences:
+                if convergence.score < self.min_conf.get():
+                    continue
+                if self.convergence_recently_reported(convergence, now):
+                    continue
+                self.convergences.appendleft(convergence)
+                self.alert_banner.set(
+                    f"ALERT • {convergence.source_count} WORLDS → "
+                    f"{convergence.destination} • "
+                    f"~{convergence.appeared} appeared • "
+                    f"{likelihood_label(convergence.score)}"
+                )
+                if self.sound_alerts.get() and winsound:
+                    try:
+                        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                    except Exception:
+                        pass
 
             for change in drops + gains:
                 if change.world in matched_worlds:
@@ -999,6 +1138,20 @@ class App:
         # Rolling changes already look across the entire 10-second window.
         results, _, _ = match_changes(drops, gains, now, histories)
         return [h for h in results if not self.hop_recently_reported(h.source, h.destination, now)]
+
+    def convergence_recently_reported(self, convergence, now):
+        current_sources = frozenset(convergence.sources)
+        cutoff = now - MOVEMENT_WINDOW
+        # Keep only recent convergence records and suppress the same destination
+        # repeatedly firing while the same set of source worlds is still present.
+        kept = deque(maxlen=self.convergences.maxlen)
+        for item in self.convergences:
+            if item.timestamp >= cutoff:
+                kept.append(item)
+                if item.destination == convergence.destination and frozenset(item.sources) == current_sources:
+                    return True
+        self.convergences = kept
+        return False
 
     def is_watched(self, world):
         if not self.watch_enabled.get():
@@ -1056,6 +1209,27 @@ class App:
             self.chains = [c for c in self.chains if c.is_alive()]
             for index, chain in enumerate(self.chains):
                 self.tree.insert("", "end", iid=f"c{index}", values=("ACTIVE", " → ".join(map(str, chain.route)), f"~{chain.size}", chain.hop_count, likelihood_label(chain.score), time.strftime("%H:%M:%S", time.localtime(chain.last_time))), tags=(likelihood_tag(chain.score),))
+        elif self.view == "convergences":
+            for convergence in list(self.convergences):
+                if convergence.score < self.min_conf.get():
+                    continue
+                source_text = " + ".join(
+                    f"{world} (-{amount})"
+                    for world, amount in zip(convergence.sources, convergence.source_amounts)
+                )
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        source_text,
+                        convergence.destination,
+                        f"+{convergence.appeared}",
+                        f"~{convergence.total_outflow}",
+                        likelihood_label(convergence.score),
+                        time.strftime("%H:%M:%S", time.localtime(convergence.timestamp)),
+                    ),
+                    tags=(likelihood_tag(convergence.score),)
+                )
         elif self.view == "worlds":
             for world in self.visible_worlds():
                 tags = ("watch",) if watch_world == world.world else ()
@@ -1080,12 +1254,18 @@ class App:
                 self.detail.set(f"ACTIVE GROUP • ~{chain.size} players • {chain.hop_count} hops • {likelihood_label(chain.score)} • last seen {int(chain.age)}s ago • Route: {' → '.join(map(str, chain.route))}")
         elif self.view == "hops":
             self.detail.set(f"World {values[0]} → {values[1]} • {values[2]} left • {values[3]} appeared • estimated group {values[4]} • {values[5]}")
+        elif self.view == "convergences":
+            self.detail.set(
+                f"{values[0]} → World {values[1]} • {values[2]} appeared • "
+                f"combined source outflow ~{values[3]} • {values[4]}"
+            )
         elif self.view == "alerts":
             self.detail.set(f"World {values[0]} • {values[1]} of {abs(int(values[2]))} players • {values[3]} • {values[5]}")
 
     def clear_history(self):
         self.hops.clear()
         self.movements.clear()
+        self.convergences.clear()
         self.chains.clear()
         self.alerts.clear()
         self.last_alert_signature.clear()
