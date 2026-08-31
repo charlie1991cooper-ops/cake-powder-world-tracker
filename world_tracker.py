@@ -1,6 +1,7 @@
 import html
 import json
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -25,6 +26,7 @@ MOVEMENT_WINDOW = 10
 MAX_TRACKED_MOVEMENT = 400
 APP_NAME = "Cake's OSRS World Tracker"
 APP_PASSWORD = "1234"
+STARTUP_LOG = Path.home() / "cakes_osrs_tracker_startup.log"
 CONVERGENCE_WINDOW = 30
 DINK_HOST = "127.0.0.1"
 DINK_PORT = 8080
@@ -1333,14 +1335,22 @@ class App:
         self.draw()
 
 
+def log_startup_error(exc):
+    try:
+        with STARTUP_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {type(exc).__name__}: {exc}\n")
+    except Exception:
+        pass
+
+
 class PasswordWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.unlocked = False
         self.title("Cake's OSRS World Tracker")
-        self.geometry("390x205")
-        self.minsize(390, 205)
-        self.maxsize(390, 205)
+        self.geometry("460x290")
+        self.minsize(460, 290)
+        self.maxsize(460, 290)
         self.configure(bg="#0b1018")
 
         try:
@@ -1366,6 +1376,11 @@ class PasswordWindow(tk.Tk):
             background="#0b1018",
             foreground="#aeb9ca",
             font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Login.TButton",
+            font=("Segoe UI", 10, "bold"),
+            padding=(12, 8),
         )
         style.configure(
             "LoginError.TLabel",
@@ -1394,6 +1409,14 @@ class PasswordWindow(tk.Tk):
         self.entry.pack(fill="x")
         self.entry.bind("<Return>", lambda _event: self.unlock())
 
+        ttk.Label(
+            frame,
+            text="Need the password? Ask me on Discord: ____cooper_____",
+            style="LoginText.TLabel",
+            wraplength=400,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
         self.error = tk.StringVar()
         ttk.Label(
             frame,
@@ -1408,13 +1431,17 @@ class PasswordWindow(tk.Tk):
             button_row,
             text="Exit",
             command=self.cancel,
-        ).pack(side="right")
+            width=12,
+            style="Login.TButton",
+        ).pack(side="right", padx=(8, 0))
 
         ttk.Button(
             button_row,
             text="Unlock",
             command=self.unlock,
-        ).pack(side="right", padx=(0, 8))
+            width=12,
+            style="Login.TButton",
+        ).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self.cancel)
 
@@ -1456,16 +1483,32 @@ class PasswordWindow(tk.Tk):
 
 
 def run_app():
-    login = PasswordWindow()
-    login.mainloop()
+    try:
+        login = PasswordWindow()
+        login.mainloop()
 
-    if not login.unlocked:
-        return
+        if not login.unlocked:
+            return
 
-    # Create the tracker only AFTER successful authentication.
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+        # Create the tracker only AFTER successful authentication.
+        root = tk.Tk()
+        App(root)
+        root.mainloop()
+    except Exception as exc:
+        log_startup_error(exc)
+        try:
+            import tkinter.messagebox as messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Cake's OSRS World Tracker",
+                f"The program could not start.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"A log was saved to:\n{STARTUP_LOG}"
+            )
+            root.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
