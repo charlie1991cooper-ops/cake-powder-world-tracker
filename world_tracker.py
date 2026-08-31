@@ -401,6 +401,9 @@ class App:
         self.watched_players = []
         self.watched_player_worlds = {}
         self.watched_player_seen = {}
+        self.watched_player_status = {}
+        self.watched_player_events = {}
+        self.dink_last_event = None
         self.dink_enabled = tk.BooleanVar(value=False)
         self.dink_status = tk.StringVar(value="Dink input disabled")
         self.load_watched_players()
@@ -506,19 +509,25 @@ class App:
     def refresh_watched_players(self):
         if not hasattr(self, "watch_tree"):
             return
+
         self.watch_tree.delete(*self.watch_tree.get_children())
+        now = time.time()
         for name in self.watched_players:
             key = name.lower()
             world = self.watched_player_worlds.get(key)
             seen = self.watched_player_seen.get(key)
-            age = (time.time() - seen) if seen else None
-            status = "ONLINE" if world and age is not None and age <= DINK_STALE_SECONDS else ("STALE" if world else "UNKNOWN")
+            status = self.watched_player_status.get(key, "UNKNOWN")
+            age = (now - seen) if seen else None
+
+            if status == "ONLINE" and age is not None and age > DINK_STALE_SECONDS:
+                status = "STALE"
+                self.watched_player_status[key] = status
+            elif status == "UNKNOWN":
+                status = "UNKNOWN"
+
             world_text = str(world) if world else "—"
             last = f"{max(0, int(age))}s" if age is not None else "—"
-            self.watch_tree.insert(
-                "", "end",
-                values=(name, status, world_text, last)
-            )
+            self.watch_tree.insert("", "end", values=(name, status, world_text, last))
 
     def set_dink_enabled(self):
         self.save_watched_players()
@@ -532,10 +541,21 @@ class App:
         if not self.dink_enabled.get():
             self.dink_status.set("Dink input disabled")
             return
-        if self.dink_server is not None:
-            self.dink_status.set(f"Listening on http://{DINK_HOST}:{DINK_PORT}{DINK_PATH}")
-        else:
+
+        if self.dink_server is None:
             self.dink_status.set("Dink enabled • starting local listener…")
+            return
+
+        base = f"Listening on http://{DINK_HOST}:{DINK_PORT}{DINK_PATH}"
+        if self.dink_last_event:
+            e = self.dink_last_event
+            world = f" • World {e['world']}" if e.get('world') else ""
+            age = max(0, int(time.time() - e['time']))
+            self.dink_status.set(
+                f"{base}\nLast: {e['type']} • {e['player']}{world} • {age}s ago"
+            )
+        else:
+            self.dink_status.set(base + "\nWaiting for Dink event…")
 
     def start_dink_server(self):
         if self.dink_server is not None:
@@ -567,65 +587,69 @@ class App:
                 pass
 
     def process_dink_event(self, event):
-        """Process only events belonging to names on the watch list."""
+        """Process only events belonging to watched players."""
         if not isinstance(event, dict):
             return
 
-        extra = event.get("extra")
-        if not isinstance(extra, dict):
-            extra = {}
-
+        extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
         name = (
-            event.get("playerName")
-            or event.get("player")
-            or event.get("username")
-            or extra.get("playerName")
-            or extra.get("username")
+            event.get("playerName") or event.get("player") or event.get("username")
+            or extra.get("playerName") or extra.get("username")
         )
         if not name:
             return
 
-        watched_name = next(
-            (
-                p for p in self.watched_players
-                if p.lower() == str(name).strip().lower()
-            ),
-            None
-        )
+        watched_name = next((p for p in self.watched_players
+                             if p.lower() == str(name).strip().lower()), None)
         if watched_name is None:
             return
 
-        world = (
-            event.get("world")
-            or extra.get("world")
-            or extra.get("worldId")
-        )
-
         key = watched_name.lower()
+        event_type = str(event.get("type") or "").upper()
         now = time.time()
-        old_world = self.watched_player_worlds.get(key)
-        self.watched_player_seen[key] = now
+        self.dink_last_event = {
+            "type": event_type or "UNKNOWN",
+            "player": watched_name,
+            "time": now,
+            "world": None,
+        }
 
+        world = event.get("world") or extra.get("world") or extra.get("worldId")
         try:
             world = int(world) if world is not None else None
         except (TypeError, ValueError):
             world = None
 
+        old_world = self.watched_player_worlds.get(key)
+        self.watched_player_seen[key] = now
+        self.watched_player_events[key] = event_type or "UNKNOWN"
+
+        if event_type in {"LOGOUT", "LOGGED_OUT"}:
+            self.watched_player_status[key] = "OFFLINE"
+            self.refresh_watched_players()
+            self.set_dink_status()
+            return
+
         if world is not None:
             self.watched_player_worlds[key] = world
+            self.watched_player_status[key] = "ONLINE"
+            self.dink_last_event["world"] = world
+
             if old_world and old_world != world:
-                event_type = str(event.get("type") or "DINK").upper()
                 self.alert_banner.set(
-                    f"ALERT • {watched_name} world change "
-                    f"{old_world} → {world} • {event_type}"
+                    f"ALERT • {watched_name} world change {old_world} → {world}"
                 )
                 if self.sound_alerts.get() and winsound:
                     try:
                         winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
                     except Exception:
                         pass
+        elif event_type in {"LOGIN", "LOGGED_IN"}:
+            # We know the player is online even if the world field was absent.
+            self.watched_player_status[key] = "ONLINE"
 
         self.refresh_watched_players()
+        self.set_dink_status()
 
     def close(self):
         self.stop_dink_server()
@@ -909,6 +933,7 @@ class App:
             f"Updated {time.strftime('%H:%M:%S')} • {len(current)} worlds • "
             f"{'F2P + Members' if self.f2p.get() else 'Members only'}"
         )
+        self.refresh_watched_players()
         self.draw()
         elapsed = max(0.0, time.time() - self.last_fetch_started)
         delay = max(1000, int(INTERVAL * 1000 - elapsed * 1000))
