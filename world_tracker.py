@@ -1030,20 +1030,36 @@ class App:
         self.draw()
 
     def refresh(self):
+        # Do not start overlapping world-list requests. A slow request or
+        # temporary network failure must never create a pile-up of workers.
+        if self.fetch_in_progress:
+            return
+        self.fetch_in_progress = True
         self.last_fetch_started = time.time()
         threading.Thread(target=self.worker, daemon=True).start()
 
     def worker(self):
         try:
             worlds = fetch_worlds()
-            self.root.after(0, lambda: self.apply_worlds(worlds))
+            # Capture the result in the lambda default argument so it remains
+            # valid after this worker thread exits.
+            self.root.after(0, lambda worlds=worlds: self.apply_worlds(worlds))
         except Exception as exc:
-            self.root.after(0, lambda: self.fetch_failed(str(exc)))
+            # Python clears the exception variable at the end of an except
+            # block. Capture the string now or the Tk callback can fail later
+            # with a NameError.
+            message = str(exc) or exc.__class__.__name__
+            self.root.after(0, lambda message=message: self.fetch_failed(message))
 
     def fetch_failed(self, message):
+        self.fetch_in_progress = False
+        self.fetch_failures = min(self.fetch_failures + 1, 5)
         self.status.set("Update failed; retrying…")
         self.detail.set(f"Could not update world data: {message}")
-        self.root.after(int(INTERVAL * 1000), self.refresh)
+        # Back off a little after repeated failures instead of immediately
+        # hammering the source again. Maximum retry delay: 20 seconds.
+        delay = int(min(20, 2 ** self.fetch_failures) * 1000)
+        self.root.after(delay, self.refresh)
 
     def apply_worlds(self, worlds):
         # Clamp user-editable thresholds to the supported range.
@@ -1361,14 +1377,38 @@ class LoginDialog(tk.Toplevel):
         self.destroy()
 
 
+def report_startup_error(exc):
+    message = f"{exc.__class__.__name__}: {exc}"
+    try:
+        log_path = Path.home() / "cakes_osrs_tracker_error.log"
+        log_path.write_text(message + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        temp = tk.Tk()
+        temp.withdraw()
+        from tkinter import messagebox
+        messagebox.showerror(
+            "Cake's OSRS World Tracker",
+            "The tracker could not start.\n\n" + message +
+            "\n\nA log was saved to your home folder as cakes_osrs_tracker_error.log."
+        )
+        temp.destroy()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    root.withdraw()
-    login = LoginDialog(root)
-    root.wait_window(login)
-    if login.result:
-        root.deiconify()
-        App(root)
-        root.mainloop()
-    else:
-        root.destroy()
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        login = LoginDialog(root)
+        root.wait_window(login)
+        if login.result:
+            root.deiconify()
+            App(root)
+            root.mainloop()
+        else:
+            root.destroy()
+    except Exception as exc:
+        report_startup_error(exc)
