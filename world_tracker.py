@@ -20,7 +20,9 @@ except ImportError:
     winsound = None
 
 SOURCE_URL = "https://oldschool.runescape.com/slu"
-INTERVAL = 10
+INTERVAL = 2
+MOVEMENT_WINDOW = 10
+MAX_TRACKED_MOVEMENT = 400
 APP_NAME = "Cake's OSRS World Tracker"
 DINK_HOST = "127.0.0.1"
 DINK_PORT = 8080
@@ -160,6 +162,11 @@ def collect_changes(prev, cur, min_group):
     gains = []
     for world in set(prev) & set(cur):
         delta = cur[world].players - prev[world].players
+        # Ignore very large population swings. These are more likely to be
+        # world-list/data anomalies than a single moving group.
+        magnitude = abs(delta)
+        if magnitude > MAX_TRACKED_MOVEMENT:
+            continue
         if delta <= -min_group:
             drops.append((world, -delta))
         elif delta >= min_group:
@@ -667,7 +674,7 @@ class App:
             ttk.Button(toolbar, text=text, command=lambda v=view: self.set_view(v)).pack(side="left", padx=3)
         ttk.Checkbutton(toolbar, text="Include F2P worlds", variable=self.f2p, command=self.reset_baseline).pack(side="left", padx=18)
         ttk.Button(toolbar, text="Refresh Now", style="Accent.TButton", command=self.refresh).pack(side="right", padx=3)
-        ttk.Label(toolbar, text="10-second detection window", style="Status.TLabel").pack(side="right", padx=12)
+        ttk.Label(toolbar, text="10-second movement matching window", style="Status.TLabel").pack(side="right", padx=12)
 
         body = ttk.Frame(self.root)
         body.pack(fill="both", expand=True, padx=18, pady=4)
@@ -677,7 +684,7 @@ class App:
         settings.configure(width=245)
 
         ttk.Label(settings, text="Minimum group size").pack(anchor="w", pady=(2, 4))
-        ttk.Spinbox(settings, from_=1, to=500, textvariable=self.min_group, width=9).pack(anchor="w")
+        ttk.Spinbox(settings, from_=1, to=400, textvariable=self.min_group, width=9).pack(anchor="w")
         ttk.Label(settings, text="Minimum likelihood level").pack(anchor="w", pady=(13, 4))
         ttk.Combobox(settings, values=("Possible (50)", "Likely (75)", "Very likely (90)"), state="readonly", width=18).pack(anchor="w")
         # Keep the actual threshold simple and compatible with the existing variable.
@@ -687,7 +694,7 @@ class App:
 
         ttk.Separator(settings).pack(fill="x", pady=14)
         ttk.Label(settings, text="Single-world movement threshold").pack(anchor="w", pady=(0, 4))
-        ttk.Spinbox(settings, from_=1, to=500, textvariable=self.min_world_move, width=9).pack(anchor="w")
+        ttk.Spinbox(settings, from_=1, to=400, textvariable=self.min_world_move, width=9).pack(anchor="w")
         ttk.Label(settings, text="This detects unusual + / − changes\neven without a matching world.", foreground="#8d9ab0").pack(anchor="w", pady=(4, 10))
 
         ttk.Separator(settings).pack(fill="x", pady=8)
@@ -888,7 +895,7 @@ class App:
     def fetch_failed(self, message):
         self.status.set("Update failed; retrying…")
         self.detail.set(f"Could not update world data: {message}")
-        self.root.after(INTERVAL * 1000, self.refresh)
+        self.root.after(int(INTERVAL * 1000), self.refresh)
 
     def apply_worlds(self, worlds):
         self.worlds = worlds
@@ -915,6 +922,8 @@ class App:
                 delta = current[world].players - self.previous[world].players
                 if abs(delta) < self.min_world_move.get():
                     continue
+                if abs(delta) > MAX_TRACKED_MOVEMENT:
+                    continue
                 score, baseline = movement_score(delta, histories[world], self.min_world_move.get())
                 watched = self.is_watched(world)
                 watch_threshold = self.watch_threshold.get()
@@ -936,12 +945,12 @@ class App:
         self.refresh_watched_players()
         self.draw()
         elapsed = max(0.0, time.time() - self.last_fetch_started)
-        delay = max(1000, int(INTERVAL * 1000 - elapsed * 1000))
+        delay = max(500, int(INTERVAL * 1000 - elapsed * 1000))
         self.root.after(delay, self.refresh)
 
     def detect_with_pending(self, drops, gains, now, histories):
-        """Match same-snapshot changes first, then unmatched changes from the last 20s."""
-        cutoff = now - 20
+        """Match same-snapshot changes first, then unmatched changes from the last 10s."""
+        cutoff = now - MOVEMENT_WINDOW
         self.pending_drops = deque((x for x in self.pending_drops if x[2] >= cutoff), maxlen=100)
         self.pending_gains = deque((x for x in self.pending_gains if x[2] >= cutoff), maxlen=100)
 
@@ -961,10 +970,8 @@ class App:
                 age = max(0.0, now - ts)
                 ratio = ratio_score(left, appeared)
                 score = 45 * ratio + 35
-                if age <= 10:
+                if age <= MOVEMENT_WINDOW:
                     score += 8
-                elif age <= 20:
-                    score += 4
                 if abs(source - destination) == 1:
                     score += 5
                 cross_candidates.append((score, source, destination, left, appeared, ts))
@@ -973,10 +980,8 @@ class App:
                 age = max(0.0, now - ts)
                 ratio = ratio_score(left, appeared)
                 score = 45 * ratio + 35
-                if age <= 10:
+                if age <= MOVEMENT_WINDOW:
                     score += 8
-                elif age <= 20:
-                    score += 4
                 if abs(source - destination) == 1:
                     score += 5
                 cross_candidates.append((score, source, destination, left, appeared, ts))
