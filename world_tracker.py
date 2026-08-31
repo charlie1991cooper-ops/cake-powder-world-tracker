@@ -1333,82 +1333,140 @@ class App:
         self.draw()
 
 
-class LoginDialog(tk.Toplevel):
-    def __init__(self, master):
-        super().__init__(master)
-        self.result = False
-        self.title("Cake's OSRS World Tracker - Login")
-        self.geometry("380x190")
-        self.resizable(False, False)
+class PasswordWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.unlocked = False
+        self.title("Cake's OSRS World Tracker")
+        self.geometry("390x205")
+        self.minsize(390, 205)
+        self.maxsize(390, 205)
         self.configure(bg="#0b1018")
-        self.transient(master)
-        self.grab_set()
 
-        frame = ttk.Frame(self, padding=24)
+        try:
+            self.iconname("Cake's OSRS World Tracker")
+        except Exception:
+            pass
+
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("Login.TFrame", background="#0b1018")
+        style.configure(
+            "LoginTitle.TLabel",
+            background="#0b1018",
+            foreground="#f4f7fb",
+            font=("Segoe UI", 17, "bold"),
+        )
+        style.configure(
+            "LoginText.TLabel",
+            background="#0b1018",
+            foreground="#aeb9ca",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "LoginError.TLabel",
+            background="#0b1018",
+            foreground="#ff5964",
+            font=("Segoe UI", 9),
+        )
+
+        frame = ttk.Frame(self, padding=24, style="Login.TFrame")
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Cake's OSRS World Tracker", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="Password").pack(anchor="w", pady=(16, 5))
+
+        ttk.Label(
+            frame,
+            text="Cake's OSRS World Tracker",
+            style="LoginTitle.TLabel",
+        ).pack(anchor="w")
+
+        ttk.Label(
+            frame,
+            text="Enter password to open the tracker",
+            style="LoginText.TLabel",
+        ).pack(anchor="w", pady=(7, 12))
 
         self.password = tk.StringVar()
-        entry = ttk.Entry(frame, textvariable=self.password, show="*")
-        entry.pack(fill="x")
-        entry.focus_set()
-        entry.bind("<Return>", lambda _e: self.submit())
+        self.entry = ttk.Entry(frame, textvariable=self.password, show="*")
+        self.entry.pack(fill="x")
+        self.entry.bind("<Return>", lambda _event: self.unlock())
 
         self.error = tk.StringVar()
-        ttk.Label(frame, textvariable=self.error, foreground="#ff5964").pack(anchor="w", pady=(6, 0))
+        ttk.Label(
+            frame,
+            textvariable=self.error,
+            style="LoginError.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
 
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill="x", pady=(12, 0))
-        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right")
-        ttk.Button(buttons, text="Unlock", style="Accent.TButton", command=self.submit).pack(side="right", padx=(0, 8))
+        button_row = ttk.Frame(frame, style="Login.TFrame")
+        button_row.pack(fill="x", pady=(13, 0))
+
+        ttk.Button(
+            button_row,
+            text="Exit",
+            command=self.cancel,
+        ).pack(side="right")
+
+        ttk.Button(
+            button_row,
+            text="Unlock",
+            command=self.unlock,
+        ).pack(side="right", padx=(0, 8))
+
         self.protocol("WM_DELETE_WINDOW", self.cancel)
 
-    def submit(self):
+        # Make the window visible and focused immediately.
+        self.update_idletasks()
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(250, lambda: self.attributes("-topmost", False))
+        self.after(50, self._focus_entry)
+        self.grab_set()
+
+    def _focus_entry(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.entry.focus_force()
+        except tk.TclError:
+            pass
+
+    def unlock(self):
         if self.password.get() == APP_PASSWORD:
-            self.result = True
+            self.unlocked = True
+            self.grab_release()
             self.destroy()
-        else:
-            self.password.set("")
-            self.error.set("Incorrect password.")
+            return
+
+        self.password.set("")
+        self.error.set("Incorrect password.")
+        self._focus_entry()
 
     def cancel(self):
-        self.result = False
+        self.unlocked = False
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
         self.destroy()
 
 
-def report_startup_error(exc):
-    message = f"{exc.__class__.__name__}: {exc}"
-    try:
-        log_path = Path.home() / "cakes_osrs_tracker_error.log"
-        log_path.write_text(message + "\n", encoding="utf-8")
-    except Exception:
-        pass
-    try:
-        temp = tk.Tk()
-        temp.withdraw()
-        from tkinter import messagebox
-        messagebox.showerror(
-            "Cake's OSRS World Tracker",
-            "The tracker could not start.\n\n" + message +
-            "\n\nA log was saved to your home folder as cakes_osrs_tracker_error.log."
-        )
-        temp.destroy()
-    except Exception:
-        pass
+def run_app():
+    login = PasswordWindow()
+    login.mainloop()
+
+    if not login.unlocked:
+        return
+
+    # Create the tracker only AFTER successful authentication.
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        login = LoginDialog(root)
-        root.wait_window(login)
-        if login.result:
-            root.deiconify()
-            App(root)
-            root.mainloop()
-        else:
-            root.destroy()
-    except Exception as exc:
-        report_startup_error(exc)
+    run_app()
