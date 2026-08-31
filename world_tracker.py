@@ -23,7 +23,6 @@ SOURCE_URL = "https://oldschool.runescape.com/slu"
 INTERVAL = 2
 MOVEMENT_WINDOW = 10
 MAX_TRACKED_MOVEMENT = 400
-NETWORK_TIMEOUT = 15
 APP_NAME = "Cake's OSRS World Tracker"
 DINK_HOST = "127.0.0.1"
 DINK_PORT = 8080
@@ -59,6 +58,18 @@ class WorldMovement:
     baseline: float
     timestamp: float
     watched: bool = False
+
+
+@dataclass(frozen=True)
+class Change:
+    world: int
+    amount: int
+    start_time: float
+    end_time: float
+
+    @property
+    def magnitude(self):
+        return abs(self.amount)
 
 
 class WorldParser(HTMLParser):
@@ -116,7 +127,7 @@ def fetch_worlds():
         SOURCE_URL,
         headers={"User-Agent": "Cakes-OSRS-World-Tracker/6.0"},
     )
-    with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT) as response:
+    with urllib.request.urlopen(req, timeout=15) as response:
         raw = response.read().decode("utf-8", "replace")
 
     parser = WorldParser()
@@ -153,92 +164,97 @@ def ratio_score(left, appeared):
 
 
 def detect_hops(prev, cur, min_group, delta_history=None):
-    drops, gains = collect_changes(prev, cur, min_group)
-    results, _, _ = match_changes(drops, gains, time.time(), delta_history)
+    now = time.time()
+    changes = []
+    for world in set(prev) & set(cur):
+        delta = cur[world].players - prev[world].players
+        if min_group <= abs(delta) <= MAX_TRACKED_MOVEMENT:
+            changes.append(Change(world, delta, now, now))
+    drops = [c for c in changes if c.amount < 0]
+    gains = [c for c in changes if c.amount > 0]
+    results, _, _ = match_changes(drops, gains, now, delta_history)
     return results
 
 
-def collect_changes(prev, cur, min_group):
-    drops = []
-    gains = []
-    for world in set(prev) & set(cur):
-        delta = cur[world].players - prev[world].players
-        # Ignore very large population swings. These are more likely to be
-        # world-list/data anomalies than a single moving group.
-        magnitude = abs(delta)
-        if magnitude > MAX_TRACKED_MOVEMENT:
+def rolling_changes(snapshot_history, current, now, min_group):
+    if not snapshot_history:
+        return [], []
+    cutoff = now - MOVEMENT_WINDOW
+    prior = [(ts, snap) for ts, snap in snapshot_history if cutoff <= ts < now]
+    drops, gains = [], []
+    for world, cur_world in current.items():
+        best = None
+        for ts, snap in prior:
+            old = snap.get(world)
+            if old is None:
+                continue
+            delta = cur_world.players - old.players
+            magnitude = abs(delta)
+            if magnitude < min_group or magnitude > MAX_TRACKED_MOVEMENT:
+                continue
+            rank = (magnitude, -(now - ts))
+            if best is None or rank > best[0]:
+                best = (rank, delta, ts)
+        if best is None:
             continue
-        if delta <= -min_group:
-            drops.append((world, -delta))
-        elif delta >= min_group:
-            gains.append((world, delta))
+        _, delta, start_time = best
+        change = Change(world, delta, start_time, now)
+        (drops if delta < 0 else gains).append(change)
     return drops, gains
 
 
 def match_changes(drops, gains, timestamp, delta_history=None):
-    """Match a drop to a gain using size, noise, and a small world-number bonus."""
     delta_history = delta_history or {}
     pairs = []
-    for source, left in drops:
-        for destination, appeared in gains:
-            ratio = ratio_score(left, appeared)
+    for source in drops:
+        for destination in gains:
+            ratio = ratio_score(source.magnitude, destination.magnitude)
             if ratio <= 0:
                 continue
-
-            score = 58 * ratio
-            size = max(left, appeared)
-            if size <= 6:
-                score -= 8
-            elif size <= 10:
+            timing_quality = 1.0 - min(abs(source.start_time - destination.start_time), MOVEMENT_WINDOW) / MOVEMENT_WINDOW
+            size = max(source.magnitude, destination.magnitude)
+            score = 40.0 * ratio + 22.0 * timing_quality + min(15.0, size / 20.0 * 15.0)
+            src = list(delta_history.get(source.world, ()))
+            dst = list(delta_history.get(destination.world, ()))
+            noise = (sum(src) / len(src) if src else 0.0) + (sum(dst) / len(dst) if dst else 0.0)
+            score += min(8.0, (source.magnitude + destination.magnitude) / (noise + 1.0) * 0.30) if noise else 4.0
+            distance = abs(source.world - destination.world)
+            score += 3 if distance == 1 else 2 if distance <= 3 else 1 if distance <= 10 else 0
+            if size <= 5:
+                score -= 6
+            elif size <= 8:
                 score -= 3
-
-            distance = abs(source - destination)
-            if distance == 1:
-                score += 5
-            elif distance <= 3:
-                score += 3
-            elif distance <= 10:
-                score += 1
-
-            src_hist = list(delta_history.get(source, ()))
-            dst_hist = list(delta_history.get(destination, ()))
-            noise = (sum(src_hist) / len(src_hist) if src_hist else 0.0) + (sum(dst_hist) / len(dst_hist) if dst_hist else 0.0)
-            if noise > 0:
-                score += min(8, (left + appeared) / (noise + 1.0) * 0.45)
-            else:
-                score += 4
-
-            pairs.append((score, source, destination, left, appeared))
-
-    pairs.sort(reverse=True)
-    used_sources = set()
-    used_destinations = set()
-    results = []
-    for score, source, destination, left, appeared in pairs:
-        if source in used_sources or destination in used_destinations or score < 30:
+            if ratio < 0.50:
+                score -= 15
+            elif ratio < 0.65:
+                score -= 8
+            elif ratio < 0.80:
+                score -= 4
+            pairs.append((score, source, destination))
+    pairs.sort(key=lambda p: p[0], reverse=True)
+    used_sources, used_destinations, results = set(), set(), []
+    for score, source, destination in pairs:
+        if source.world in used_sources or destination.world in used_destinations or score < 45:
             continue
-        final_score = min(99, max(0, round(score)))
-        results.append(Hop(source, destination, left, appeared, max(left, appeared), final_score, timestamp))
-        used_sources.add(source)
-        used_destinations.add(destination)
+        results.append(Hop(source.world, destination.world, source.magnitude, destination.magnitude, max(source.magnitude, destination.magnitude), min(99, max(0, round(score))), timestamp))
+        used_sources.add(source.world); used_destinations.add(destination.world)
     return results, used_sources, used_destinations
 
 
 def movement_score(delta, noise_values, min_move):
-    """Score a one-world anomaly while treating small changes cautiously."""
     magnitude = abs(delta)
     if magnitude < min_move or magnitude > MAX_TRACKED_MOVEMENT:
         return 0, 0.0
     vals = list(noise_values)
     baseline = sum(vals) / len(vals) if vals else 0.0
-    ratio = magnitude / max(1.0, baseline)
-    score = 42 + min(38, ratio * 9)
+    scale = max(float(min_move), baseline * 2.5, 3.0)
+    score = 38 + min(40, (magnitude / scale) * 10)
     if magnitude >= min_move * 2:
-        score += 5
+        score += 4
     if magnitude >= min_move * 3:
-        score += 5
+        score += 4
     if magnitude <= 6:
-        score = min(score, 58)
+        score = min(score, 57)
     return min(99, round(score)), baseline
 
 
@@ -412,15 +428,13 @@ class App:
         self.chains = []
         self.alerts = deque(maxlen=250)
         self.max_chain_history = 150
-        self.delta_history = defaultdict(lambda: deque(maxlen=12))
-        # Short-lived unmatched changes let us catch a real hop when the official
-        # world list reports the source drop and destination rise one poll apart.
-        self.pending_drops = deque(maxlen=100)
-        self.pending_gains = deque(maxlen=100)
+        self.delta_history = defaultdict(lambda: deque(maxlen=24))
+        self.snapshot_history = deque(maxlen=8)
         self.last_fetch_started = 0.0
         self.last_alert_signature = {}
         self.recent_hop_signature = {}
         self.fetch_failures = 0
+        self.fetch_in_progress = False
 
         self.f2p = tk.BooleanVar(value=False)
 
@@ -722,7 +736,7 @@ class App:
         self.watch_combo = ttk.Combobox(settings, textvariable=self.watch_world, width=12, state="normal")
         self.watch_combo.pack(anchor="w")
         ttk.Label(settings, text="Watch movement threshold").pack(anchor="w", pady=(9, 4))
-        ttk.Spinbox(settings, from_=1, to=500, textvariable=self.watch_threshold, width=9).pack(anchor="w")
+        ttk.Spinbox(settings, from_=1, to=400, textvariable=self.watch_threshold, width=9).pack(anchor="w")
         ttk.Checkbutton(settings, text="Sound alerts", variable=self.sound_alerts).pack(anchor="w", pady=8)
 
         ttk.Separator(settings).pack(fill="x", pady=8)
@@ -912,157 +926,79 @@ class App:
             self.root.after(0, lambda: self.fetch_failed(str(exc)))
 
     def fetch_failed(self, message):
-        self.fetch_failures += 1
         self.status.set("Update failed; retrying…")
-        self.detail.set(f"World data update failed ({self.fetch_failures}): {message}")
-        backoff = min(30, INTERVAL * (2 ** min(self.fetch_failures - 1, 4)))
-        self.root.after(int(backoff * 1000), self.refresh)
+        self.detail.set(f"Could not update world data: {message}")
+        self.root.after(int(INTERVAL * 1000), self.refresh)
 
     def apply_worlds(self, worlds):
+        self.fetch_in_progress = False
         self.fetch_failures = 0
         self.worlds = worlds
         current = {w.world: w for w in self.visible_worlds()}
         now = time.time()
+
         if self.previous is None:
             self.previous = current
+            self.snapshot_history.clear()
+            self.snapshot_history.append((now, current))
             self.update_watch_list()
-            self.detail.set("Baseline captured. Tracking continuously; movements are matched inside the rolling 10-second window.")
+            self.detail.set(f"Baseline captured. Tracking continuously with a rolling {MOVEMENT_WINDOW}-second movement window.")
         else:
             histories = self.delta_history
-            # Use the previous noise history for scoring this snapshot; append the new
-            # delta only after it has been classified. Otherwise a genuine surge would
-            # partially train itself into looking normal.
-            drops, gains = collect_changes(self.previous, current, self.min_group.get())
+            drops, gains = rolling_changes(self.snapshot_history, current, now, self.min_group.get())
             hops = self.detect_with_pending(drops, gains, now, histories)
+            matched_worlds = {h.source for h in hops} | {h.destination for h in hops}
+
             for hop in hops:
                 if hop.score >= self.min_conf.get():
                     self.hops.insert(0, hop)
                     self.update_chain(hop)
 
-            # Detect unusual movement on a single world even when there is no matching source/destination.
-            for world in set(self.previous) & set(current):
-                delta = current[world].players - self.previous[world].players
-                if abs(delta) < self.min_world_move.get():
+            for change in drops + gains:
+                if change.world in matched_worlds:
                     continue
-                if abs(delta) > MAX_TRACKED_MOVEMENT:
-                    continue
-                score, baseline = movement_score(delta, histories[world], self.min_world_move.get())
-                watched = self.is_watched(world)
-                watch_threshold = self.watch_threshold.get()
-                if watched and abs(delta) >= watch_threshold:
+                score, baseline = movement_score(change.amount, histories[change.world], self.min_world_move.get())
+                watched = self.is_watched(change.world)
+                watch_threshold = min(MAX_TRACKED_MOVEMENT, max(1, self.watch_threshold.get()))
+                if watched and abs(change.amount) >= watch_threshold:
                     score = max(score, 85)
-                if score >= self.min_conf.get() or (watched and abs(delta) >= watch_threshold):
-                    movement = WorldMovement(world, delta, score, baseline, now, watched)
+                if score >= self.min_conf.get() or (watched and abs(change.amount) >= watch_threshold):
+                    movement = WorldMovement(change.world, change.amount, score, baseline, now, watched)
                     self.movements.insert(0, movement)
                     self.add_alert(movement)
-                histories[world].append(abs(delta))
+
+            # Train only on the immediate step, not the cumulative rolling movement.
+            for world in set(self.previous) & set(current):
+                step_delta = current[world].players - self.previous[world].players
+                if abs(step_delta) <= MAX_TRACKED_MOVEMENT:
+                    histories[world].append(abs(step_delta))
 
             self.previous = current
+            cutoff = now - MOVEMENT_WINDOW
+            self.snapshot_history.append((now, current))
+            self.snapshot_history = deque(((ts, snap) for ts, snap in self.snapshot_history if ts >= cutoff), maxlen=8)
             self.update_watch_list()
 
-        self.status.set(
-            f"Updated {time.strftime('%H:%M:%S')} • {len(current)} worlds • "
-            f"{'F2P + Members' if self.f2p.get() else 'Members only'}"
-        )
+        self.status.set(f"Updated {time.strftime('%H:%M:%S')} • {len(current)} worlds • {'F2P + Members' if self.f2p.get() else 'Members only'}")
         self.refresh_watched_players()
         self.draw()
         elapsed = max(0.0, time.time() - self.last_fetch_started)
-        delay = max(500, int(INTERVAL * 1000 - elapsed * 1000))
+        delay = max(700, int(INTERVAL * 1000 - elapsed * 1000))
         self.root.after(delay, self.refresh)
 
     def hop_recently_reported(self, source, destination, now):
         key = (source, destination)
         cutoff = now - MOVEMENT_WINDOW
         self.recent_hop_signature = {k: ts for k, ts in self.recent_hop_signature.items() if ts >= cutoff}
-        last = self.recent_hop_signature.get(key)
-        if last is not None:
+        if key in self.recent_hop_signature:
             return True
         self.recent_hop_signature[key] = now
         return False
 
     def detect_with_pending(self, drops, gains, now, histories):
-        """Match movements continuously inside a rolling 10-second window."""
-        cutoff = now - MOVEMENT_WINDOW
-        self.pending_drops = deque((x for x in self.pending_drops if x[2] >= cutoff), maxlen=100)
-        self.pending_gains = deque((x for x in self.pending_gains if x[2] >= cutoff), maxlen=100)
-
-        results = []
-        same, used_sources, used_destinations = match_changes(drops, gains, now, histories)
-        for hop in same:
-            if not self.hop_recently_reported(hop.source, hop.destination, now):
-                results.append(hop)
-
-        rem_drops = [(w, n) for w, n in drops if w not in used_sources]
-        rem_gains = [(w, n) for w, n in gains if w not in used_destinations]
-
-        recent_drops = list(self.pending_drops)
-        recent_gains = list(self.pending_gains)
-        candidates = []
-
-        def add_candidate(source, left, ts, destination, appeared):
-            age = max(0.0, now - ts)
-            ratio = ratio_score(left, appeared)
-            if ratio <= 0:
-                return
-            score = 52 * ratio
-            score += 14 if age <= 4 else 10 if age <= 7 else 5 if age <= MOVEMENT_WINDOW else 0
-            size = max(left, appeared)
-            if size <= 6:
-                score -= 6
-            elif size <= 10:
-                score -= 2
-            distance = abs(source - destination)
-            if distance == 1:
-                score += 5
-            elif distance <= 3:
-                score += 3
-            elif distance <= 10:
-                score += 1
-            src_hist = list(histories.get(source, ()))
-            dst_hist = list(histories.get(destination, ()))
-            noise = (sum(src_hist) / len(src_hist) if src_hist else 0.0) + (sum(dst_hist) / len(dst_hist) if dst_hist else 0.0)
-            score += min(7, (left + appeared) / (noise + 1.0) * 0.35) if noise else 4
-            candidates.append((score, source, destination, left, appeared, ts))
-
-        for source, left, ts in recent_drops:
-            for destination, appeared in rem_gains:
-                add_candidate(source, left, ts, destination, appeared)
-        for source, left in rem_drops:
-            for destination, appeared, ts in recent_gains:
-                add_candidate(source, left, ts, destination, appeared)
-
-        used_sources = {h.source for h in results}
-        used_destinations = {h.destination for h in results}
-        used_pending_drops = set()
-        used_pending_gains = set()
-
-        for score, source, destination, left, appeared, ts in sorted(candidates, reverse=True):
-            if source in used_sources or destination in used_destinations or score < 58:
-                continue
-            if self.hop_recently_reported(source, destination, now):
-                continue
-            results.append(Hop(source, destination, left, appeared, max(left, appeared), min(99, round(score)), now))
-            used_sources.add(source)
-            used_destinations.add(destination)
-            if any(x[0] == source and abs(x[2] - ts) < 0.01 for x in recent_drops):
-                used_pending_drops.add((source, ts))
-            if any(x[0] == destination and abs(x[2] - ts) < 0.01 for x in recent_gains):
-                used_pending_gains.add((destination, ts))
-
-        for source, left in rem_drops:
-            if source not in used_sources:
-                self.pending_drops.append((source, left, now))
-        for destination, appeared in rem_gains:
-            if destination not in used_destinations:
-                self.pending_gains.append((destination, appeared, now))
-
-        if used_pending_drops:
-            self.pending_drops = deque((x for x in self.pending_drops if (x[0], x[2]) not in used_pending_drops), maxlen=100)
-        if used_pending_gains:
-            self.pending_gains = deque((x for x in self.pending_gains if (x[0], x[2]) not in used_pending_gains), maxlen=100)
-
-        return results
-
+        # Rolling changes already look across the entire 10-second window.
+        results, _, _ = match_changes(drops, gains, now, histories)
+        return [h for h in results if not self.hop_recently_reported(h.source, h.destination, now)]
 
     def is_watched(self, world):
         if not self.watch_enabled.get():
@@ -1153,6 +1089,10 @@ class App:
         self.chains.clear()
         self.alerts.clear()
         self.last_alert_signature.clear()
+        self.recent_hop_signature.clear()
+        self.snapshot_history.clear()
+        self.delta_history.clear()
+        self.previous = None
         self.alert_banner.set("No alerts yet")
         self.detail.set("History cleared.")
         self.draw()
