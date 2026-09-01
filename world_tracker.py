@@ -1035,6 +1035,11 @@ class App:
 
     def reset_baseline(self):
         self.previous = None
+        self.movement_episodes.clear()
+        self.recent_movement_events.clear()
+        self.movement_history.clear()
+        self.snapshot_history.clear()
+        self.recent_hop_signature.clear()
         self.detail.set("Baseline reset; waiting for the next world snapshot.")
         self.draw()
 
@@ -1145,12 +1150,22 @@ class App:
         else:
             histories = self.delta_history
 
+            watch_threshold = min(
+                MAX_TRACKED_MOVEMENT,
+                max(1, self.watch_threshold.get()),
+            )
+            episode_threshold = min(
+                self.min_group.get(),
+                self.min_world_move.get(),
+                watch_threshold if self.watch_enabled.get() else self.min_world_move.get(),
+            )
+
             new_events = build_movement_episode(
                 self.movement_episodes,
                 self.previous,
                 current,
                 now,
-                self.min_group.get(),
+                episode_threshold,
             )
 
             # Each movement episode is one event. Keep it for the 10s hop window.
@@ -1182,12 +1197,12 @@ class App:
                 self.min_group.get(),
             )
 
-            matched_worlds = {h.source for h in hops} | {h.destination for h in hops}
+            accepted_hops = [h for h in hops if h.score >= self.min_conf.get()]
+            matched_worlds = {h.source for h in accepted_hops} | {h.destination for h in accepted_hops}
 
-            for hop in hops:
-                if hop.score >= self.min_conf.get():
-                    self.hops.insert(0, hop)
-                    self.update_chain(hop)
+            for hop in accepted_hops:
+                self.hops.insert(0, hop)
+                self.update_chain(hop)
 
             for convergence in convergences:
                 if convergence.score < self.min_conf.get():
@@ -1280,11 +1295,38 @@ class App:
             maxlen=500,
         )
 
+    def hop_recently_reported(self, source, destination, now, window_seconds=20):
+        """Suppress duplicate reports for the same ordered hop briefly.
+
+        The movement episode itself is long-lived, so without this guard the same
+        source/destination pair can be reconsidered on several polls while both
+        events remain inside the 10-second matching window.
+        """
+        cutoff = now - window_seconds
+        for key, timestamp in list(self.recent_hop_signature.items()):
+            if timestamp < cutoff:
+                self.recent_hop_signature.pop(key, None)
+
+        key = (int(source), int(destination))
+        last = self.recent_hop_signature.get(key)
+        if last is not None and now - last < window_seconds:
+            return True
+
+        self.recent_hop_signature[key] = now
+        return False
+
     def detect_with_pending(self, drops, gains, now, histories):
         """Match distinct movement episodes whose events occur within 10 seconds."""
         cutoff = now - MOVEMENT_WINDOW
-        recent_drops = [e for e in drops if e.end_time >= cutoff]
-        recent_gains = [e for e in gains if e.end_time >= cutoff]
+        min_group = min(MAX_TRACKED_MOVEMENT, max(1, self.min_group.get()))
+        recent_drops = [
+            e for e in drops
+            if e.end_time >= cutoff and e.magnitude >= min_group
+        ]
+        recent_gains = [
+            e for e in gains
+            if e.end_time >= cutoff and e.magnitude >= min_group
+        ]
 
         pairs = []
         for source in recent_drops:
