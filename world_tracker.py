@@ -28,6 +28,7 @@ APP_NAME = "Cake's OSRS World Tracker"
 APP_PASSWORD = "1234"
 STARTUP_LOG = Path.home() / "cakes_osrs_tracker_startup.log"
 CONVERGENCE_WINDOW = 30
+SNAPSHOT_HISTORY_SECONDS = 35
 DINK_HOST = "127.0.0.1"
 DINK_PORT = 8080
 DINK_PATH = "/dink"
@@ -74,6 +75,10 @@ class Change:
     @property
     def magnitude(self):
         return abs(self.amount)
+
+    @property
+    def direction(self):
+        return 1 if self.amount > 0 else -1
 
 
 @dataclass(frozen=True)
@@ -198,112 +203,164 @@ def detect_hops(prev, cur, min_group, delta_history=None):
     return results
 
 
-def rolling_changes(snapshot_history, current, now, min_group):
-    """Find the strongest net population movement for each world over the
-    rolling movement window. Uses actual timestamps instead of a fixed number
-    of snapshots, so a slow 6-10 second movement can be recognised as one event.
+def build_movement_episode(episodes, previous, current, now, min_group):
+    """Emit one event when cumulative population movement first reaches min_group.
+
+    Polling can be frequent, but a continuing population shift remains one
+    movement episode until the population crosses back through its anchor.
     """
-    if not snapshot_history:
-        return [], []
+    emitted = []
 
-    cutoff = now - MOVEMENT_WINDOW
-    prior = [(ts, snap) for ts, snap in snapshot_history if cutoff <= ts < now]
-    if not prior:
-        return [], []
+    for world in set(previous) & set(current):
+        prev_pop = previous[world].players
+        cur_pop = current[world].players
+        step = cur_pop - prev_pop
+        state = episodes.get(world)
 
-    drops, gains = [], []
-    for world, cur_world in current.items():
-        candidates = []
-        for ts, snap in prior:
-            old = snap.get(world)
-            if old is None:
+        if state is None:
+            if step == 0:
                 continue
-            delta = cur_world.players - old.players
-            magnitude = abs(delta)
-            if magnitude < min_group or magnitude > MAX_TRACKED_MOVEMENT:
-                continue
-            # Prefer large genuine movement, but when equal prefer the most recent baseline.
-            candidates.append((magnitude, ts, delta))
+            state = {
+                "direction": 1 if step > 0 else -1,
+                "anchor_population": prev_pop,
+                "start_time": now,
+                "triggered": False,
+            }
+            episodes[world] = state
 
-        if not candidates:
+        net = cur_pop - state["anchor_population"]
+        direction = state["direction"]
+
+        # End the old episode only after crossing its starting level.
+        if (direction > 0 and net < 0) or (direction < 0 and net > 0):
+            if step == 0:
+                episodes.pop(world, None)
+                continue
+            state = {
+                "direction": 1 if step > 0 else -1,
+                "anchor_population": prev_pop,
+                "start_time": now,
+                "triggered": False,
+            }
+            episodes[world] = state
+            net = cur_pop - state["anchor_population"]
+
+        if net == 0 and step == 0:
+            episodes.pop(world, None)
             continue
-        magnitude, start_time, delta = max(candidates, key=lambda x: (x[0], x[1]))
-        drops.append(Change(world, delta, start_time, now)) if delta < 0 else gains.append(Change(world, delta, start_time, now))
 
-    return drops, gains
+        magnitude = abs(net)
+
+        # Ignore/reset implausibly large jumps.
+        if magnitude > MAX_TRACKED_MOVEMENT:
+            episodes.pop(world, None)
+            continue
+
+        if magnitude >= min_group and not state["triggered"]:
+            state["triggered"] = True
+            emitted.append(
+                Change(
+                    world=world,
+                    amount=net,
+                    start_time=state["start_time"],
+                    end_time=now,
+                )
+            )
+
+    return emitted
+
+
 
 
 def detect_convergences(movement_history, timestamp, min_group):
-    """Detect multiple distinct source worlds converging on one destination.
-
-    Normal hops use a 10-second window. Convergence is intentionally given a
-    30-second window because several source worlds can feed the same destination
-    over several polls. The result is evidence of a pattern, not proof that all
-    source losses reached the destination.
-    """
+    """Detect 2+ independent source-world movement episodes into one world."""
     cutoff = timestamp - CONVERGENCE_WINDOW
-    recent = [m for m in movement_history if m["time"] >= cutoff]
-    if not recent:
-        return []
+    recent = [
+        event for event in movement_history
+        if event.end_time >= cutoff
+        and abs(event.amount) <= MAX_TRACKED_MOVEMENT
+    ]
 
-    drops_by_world = defaultdict(list)
-    gains_by_world = defaultdict(list)
-    for m in recent:
-        if abs(m["amount"]) > MAX_TRACKED_MOVEMENT:
-            continue
-        if m["amount"] <= -min_group:
-            drops_by_world[m["world"]].append(m)
-        elif m["amount"] >= min_group:
-            gains_by_world[m["world"]].append(m)
-
+    drops = [e for e in recent if e.amount <= -min_group]
+    gains = [e for e in recent if e.amount >= min_group]
     results = []
-    for destination, gain_items in gains_by_world.items():
-        # Use the strongest recent destination gain as the destination signal.
-        dest = max(gain_items, key=lambda x: abs(x["amount"]))
-        eligible = []
-        for source, source_items in drops_by_world.items():
-            if source == destination:
+
+    for destination in gains:
+        best_by_world = {}
+
+        for source in drops:
+            if source.world == destination.world:
                 continue
-            src = max(source_items, key=lambda x: abs(x["amount"]))
-            age = abs(src["time"] - dest["time"])
+
+            age = abs(source.end_time - destination.end_time)
             if age > CONVERGENCE_WINDOW:
                 continue
-            if abs(src["amount"]) < min_group:
-                continue
-            eligible.append((source, abs(src["amount"]), age, src["time"]))
 
-        if len(eligible) < 2:
+            ratio = ratio_score(source.magnitude, destination.magnitude)
+            timing = 1.0 - age / CONVERGENCE_WINDOW
+            candidate = (source, ratio, timing, ratio * 0.65 + timing * 0.35)
+
+            old = best_by_world.get(source.world)
+            if old is None or candidate[3] > old[3]:
+                best_by_world[source.world] = candidate
+
+        chosen = sorted(
+            best_by_world.values(),
+            key=lambda x: (x[3], x[0].magnitude),
+            reverse=True,
+        )[:6]
+
+        if len(chosen) < 2:
             continue
 
-        # Keep the best evidence and cap the source count.
-        eligible.sort(key=lambda x: (-(x[1]), x[2]))
-        chosen = eligible[:6]
-        sizes = [x[1] for x in chosen]
-        median_size = sorted(sizes)[len(sizes)//2]
-        consistency = 1.0 - (sum(abs(x - median_size) for x in sizes) / (sum(sizes) or 1))
+        sizes = [x[0].magnitude for x in chosen]
+        median_size = sorted(sizes)[len(sizes) // 2]
+        consistency = 1.0 - (
+            sum(abs(size - median_size) for size in sizes)
+            / max(1, sum(sizes))
+        )
         consistency = max(0.0, min(1.0, consistency))
-        avg_age = sum(x[2] for x in chosen) / len(chosen)
-        timing = max(0.0, 1.0 - avg_age / CONVERGENCE_WINDOW)
-        source_bonus = min(28, (len(chosen) - 2) * 13)
-        size_bonus = min(8, max(0, median_size - min_group) * 0.25)
 
-        score = 46 + 18 * timing + 16 * consistency + source_bonus + size_bonus
+        avg_ratio = sum(x[1] for x in chosen) / len(chosen)
+        avg_timing = sum(x[2] for x in chosen) / len(chosen)
+
+        score = (
+            43
+            + 22 * avg_ratio
+            + 18 * avg_timing
+            + 18 * consistency
+            + min(24, (len(chosen) - 2) * 12)
+        )
+
         if len(chosen) >= 3:
             score += 9
         if len(chosen) >= 4:
             score += 6
 
-        results.append(Convergence(
-            destination=destination,
-            sources=tuple(x[0] for x in chosen),
-            source_amounts=tuple(x[1] for x in chosen),
-            appeared=abs(dest["amount"]),
-            score=min(99, max(0, round(score))),
-            timestamp=timestamp,
-        ))
+        results.append(
+            Convergence(
+                destination=destination.world,
+                sources=tuple(x[0].world for x in chosen),
+                source_amounts=tuple(x[0].magnitude for x in chosen),
+                appeared=destination.magnitude,
+                score=min(99, max(0, round(score))),
+                timestamp=max(
+                    [destination.end_time] + [x[0].end_time for x in chosen]
+                ),
+            )
+        )
 
-    results.sort(key=lambda c: (c.score, c.source_count), reverse=True)
-    return results
+    # One best pattern per destination.
+    best = {}
+    for result in results:
+        if result.destination not in best or result.score > best[result.destination].score:
+            best[result.destination] = result
+
+    return sorted(
+        best.values(),
+        key=lambda x: (x.score, x.source_count),
+        reverse=True,
+    )
 
 
 def match_changes(drops, gains, timestamp, delta_history=None):
@@ -529,12 +586,14 @@ class App:
         self.hops = []
         self.movements = []
         self.convergences = deque(maxlen=150)
-        self.movement_history = deque(maxlen=2000)
+        self.movement_history = deque(maxlen=500)
+        self.movement_episodes = {}
+        self.recent_movement_events = deque(maxlen=500)
         self.chains = []
         self.alerts = deque(maxlen=250)
         self.max_chain_history = 150
         self.delta_history = defaultdict(lambda: deque(maxlen=24))
-        self.snapshot_history = deque(maxlen=8)
+        self.snapshot_history = deque(maxlen=30)
         self.last_fetch_started = 0.0
         self.last_alert_signature = {}
         self.recent_hop_signature = {}
@@ -1064,10 +1123,10 @@ class App:
         self.root.after(delay, self.refresh)
 
     def apply_worlds(self, worlds):
-        # Clamp user-editable thresholds to the supported range.
         self.min_group.set(min(MAX_TRACKED_MOVEMENT, max(1, self.min_group.get())))
         self.min_world_move.set(min(MAX_TRACKED_MOVEMENT, max(1, self.min_world_move.get())))
         self.watch_threshold.set(min(MAX_TRACKED_MOVEMENT, max(1, self.watch_threshold.get())))
+
         self.fetch_in_progress = False
         self.fetch_failures = 0
         self.worlds = worlds
@@ -1079,20 +1138,50 @@ class App:
             self.snapshot_history.clear()
             self.snapshot_history.append((now, current))
             self.update_watch_list()
-            self.detail.set(f"Baseline captured. Tracking continuously with a rolling {MOVEMENT_WINDOW}-second movement window.")
+            self.detail.set(
+                f"Baseline captured. Tracking with a rolling "
+                f"{MOVEMENT_WINDOW}-second movement window."
+            )
         else:
             histories = self.delta_history
-            drops, gains = rolling_changes(self.snapshot_history, current, now, self.min_group.get())
 
-            # Keep one rolling record per observed world movement. This is used
-            # for multi-world patterns over 30 seconds without treating every
-            # 2-second poll as a brand-new event.
-            for change in drops + gains:
-                self._record_movement_event(change, now)
-            self._prune_movement_history(now)
+            new_events = build_movement_episode(
+                self.movement_episodes,
+                self.previous,
+                current,
+                now,
+                self.min_group.get(),
+            )
+
+            # Each movement episode is one event. Keep it for the 10s hop window.
+            self.recent_movement_events.extend(new_events)
+            self.recent_movement_events = self.prune_event_queue(
+                self.recent_movement_events,
+                now,
+                MOVEMENT_WINDOW,
+            )
+
+            # And for the broader 30s convergence pattern.
+            self.movement_history.extend(new_events)
+            self.movement_history = deque(
+                (
+                    event for event in self.movement_history
+                    if event.end_time >= now - CONVERGENCE_WINDOW
+                ),
+                maxlen=500,
+            )
+
+            recent_events = list(self.recent_movement_events)
+            drops = [e for e in recent_events if e.amount < 0]
+            gains = [e for e in recent_events if e.amount > 0]
 
             hops = self.detect_with_pending(drops, gains, now, histories)
-            convergences = detect_convergences(self.movement_history, now, self.min_group.get())
+            convergences = detect_convergences(
+                self.movement_history,
+                now,
+                self.min_group.get(),
+            )
+
             matched_worlds = {h.source for h in hops} | {h.destination for h in hops}
 
             for hop in hops:
@@ -1100,114 +1189,196 @@ class App:
                     self.hops.insert(0, hop)
                     self.update_chain(hop)
 
-            # Convergence is a separate pattern: multiple source worlds
-            # feeding one destination in the same rolling window.
             for convergence in convergences:
                 if convergence.score < self.min_conf.get():
                     continue
                 if self.convergence_recently_reported(convergence, now):
                     continue
+
                 self.convergences.appendleft(convergence)
                 self.alert_banner.set(
                     f"ALERT • {convergence.source_count} WORLDS → "
                     f"{convergence.destination} • "
-                    f"~{convergence.appeared} appeared • "
+                    f"~{convergence.appeared} destination gain • "
                     f"{likelihood_label(convergence.score)}"
                 )
+
                 if self.sound_alerts.get() and winsound:
                     try:
                         winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
                     except Exception:
                         pass
 
-            for change in drops + gains:
+            # Single-world alerts are generated only when a movement episode
+            # first crosses the threshold; stable population shifts do not re-fire.
+            for change in new_events:
                 if change.world in matched_worlds:
                     continue
-                score, baseline = movement_score(change.amount, histories[change.world], self.min_world_move.get())
+
+                score, baseline = movement_score(
+                    change.amount,
+                    histories[change.world],
+                    self.min_world_move.get(),
+                )
                 watched = self.is_watched(change.world)
-                watch_threshold = min(MAX_TRACKED_MOVEMENT, max(1, self.watch_threshold.get()))
+                watch_threshold = min(
+                    MAX_TRACKED_MOVEMENT,
+                    max(1, self.watch_threshold.get()),
+                )
+
                 if watched and abs(change.amount) >= watch_threshold:
                     score = max(score, 85)
-                if score >= self.min_conf.get() or (watched and abs(change.amount) >= watch_threshold):
-                    movement = WorldMovement(change.world, change.amount, score, baseline, now, watched)
+
+                if score >= self.min_conf.get() or (
+                    watched and abs(change.amount) >= watch_threshold
+                ):
+                    movement = WorldMovement(
+                        change.world,
+                        change.amount,
+                        score,
+                        baseline,
+                        now,
+                        watched,
+                    )
                     self.movements.insert(0, movement)
                     self.add_alert(movement)
 
-            # Train only on the immediate step, not the cumulative rolling movement.
+            # Learn ordinary short-term noise only from the immediate step.
             for world in set(self.previous) & set(current):
                 step_delta = current[world].players - self.previous[world].players
                 if abs(step_delta) <= MAX_TRACKED_MOVEMENT:
                     histories[world].append(abs(step_delta))
 
             self.previous = current
-            cutoff = now - MOVEMENT_WINDOW
             self.snapshot_history.append((now, current))
-            self.snapshot_history = deque(((ts, snap) for ts, snap in self.snapshot_history if ts >= cutoff), maxlen=8)
+            snapshot_cutoff = now - SNAPSHOT_HISTORY_SECONDS
+            self.snapshot_history = deque(
+                (
+                    (ts, snap)
+                    for ts, snap in self.snapshot_history
+                    if ts >= snapshot_cutoff
+                ),
+                maxlen=30,
+            )
             self.update_watch_list()
 
-        self.status.set(f"Updated {time.strftime('%H:%M:%S')} • {len(current)} worlds • {'F2P + Members' if self.f2p.get() else 'Members only'}")
+        self.status.set(
+            f"Updated {time.strftime('%H:%M:%S')} • {len(current)} worlds • "
+            f"{'F2P + Members' if self.f2p.get() else 'Members only'}"
+        )
         self.refresh_watched_players()
         self.draw()
+
         elapsed = max(0.0, time.time() - self.last_fetch_started)
         delay = max(700, int(INTERVAL * 1000 - elapsed * 1000))
         self.root.after(delay, self.refresh)
 
-    def _record_movement_event(self, change, now):
-        key = (change.world, "in" if change.amount > 0 else "out")
-        # Replace an existing same-sign event for this world when this poll has
-        # stronger evidence. This prevents repeatedly counting a continuing
-        # population shift as several independent source worlds.
-        for idx, item in enumerate(self.movement_history):
-            if item["key"] == key:
-                if abs(change.amount) >= abs(item["amount"]):
-                    self.movement_history[idx] = {
-                        "key": key,
-                        "world": change.world,
-                        "amount": change.amount,
-                        "time": now,
-                    }
-                return
-        self.movement_history.append({
-            "key": key,
-            "world": change.world,
-            "amount": change.amount,
-            "time": now,
-        })
-
-    def _prune_movement_history(self, now):
-        cutoff = now - CONVERGENCE_WINDOW
-        self.movement_history = deque(
-            (x for x in self.movement_history if x["time"] >= cutoff),
-            maxlen=2000,
+    def prune_event_queue(self, events, now, window_seconds):
+        cutoff = now - window_seconds
+        return deque(
+            (event for event in events if event.end_time >= cutoff),
+            maxlen=500,
         )
 
-    def hop_recently_reported(self, source, destination, now):
-        key = (source, destination)
-        cutoff = now - MOVEMENT_WINDOW
-        self.recent_hop_signature = {k: ts for k, ts in self.recent_hop_signature.items() if ts >= cutoff}
-        if key in self.recent_hop_signature:
-            return True
-        self.recent_hop_signature[key] = now
-        return False
-
     def detect_with_pending(self, drops, gains, now, histories):
-        # Rolling changes already look across the entire 10-second window.
-        results, _, _ = match_changes(drops, gains, now, histories)
-        return [h for h in results if not self.hop_recently_reported(h.source, h.destination, now)]
+        """Match distinct movement episodes whose events occur within 10 seconds."""
+        cutoff = now - MOVEMENT_WINDOW
+        recent_drops = [e for e in drops if e.end_time >= cutoff]
+        recent_gains = [e for e in gains if e.end_time >= cutoff]
+
+        pairs = []
+        for source in recent_drops:
+            for destination in recent_gains:
+                if source.world == destination.world:
+                    continue
+
+                age = abs(source.end_time - destination.end_time)
+                if age > MOVEMENT_WINDOW:
+                    continue
+
+                ratio = ratio_score(source.magnitude, destination.magnitude)
+                timing = 1.0 - age / MOVEMENT_WINDOW
+                size = max(source.magnitude, destination.magnitude)
+
+                score = (
+                    42.0 * ratio
+                    + 28.0 * timing
+                    + min(18.0, size / 25.0 * 18.0)
+                )
+
+                if ratio < 0.50:
+                    score -= 18
+                elif ratio < 0.65:
+                    score -= 10
+                elif ratio < 0.80:
+                    score -= 5
+
+                if size <= 6:
+                    score -= 5
+
+                distance = abs(source.world - destination.world)
+                score += (
+                    3 if distance == 1
+                    else 2 if distance <= 3
+                    else 1 if distance <= 10
+                    else 0
+                )
+
+                pairs.append((score, source, destination))
+
+        pairs.sort(key=lambda x: x[0], reverse=True)
+
+        used_sources = set()
+        used_destinations = set()
+        results = []
+
+        for score, source, destination in pairs:
+            source_key = (source.world, source.start_time, source.end_time, source.amount)
+            destination_key = (destination.world, destination.start_time, destination.end_time, destination.amount)
+
+            if source_key in used_sources or destination_key in used_destinations:
+                continue
+            if score < 45:
+                continue
+
+            results.append(
+                Hop(
+                    source=source.world,
+                    destination=destination.world,
+                    left=source.magnitude,
+                    appeared=destination.magnitude,
+                    moved=max(source.magnitude, destination.magnitude),
+                    score=min(99, max(0, round(score))),
+                    timestamp=max(source.end_time, destination.end_time),
+                )
+            )
+            used_sources.add(source_key)
+            used_destinations.add(destination_key)
+
+        return [
+            hop for hop in results
+            if not self.hop_recently_reported(hop.source, hop.destination, now)
+        ]
 
     def convergence_recently_reported(self, convergence, now):
-        current_sources = frozenset(convergence.sources)
         cutoff = now - CONVERGENCE_WINDOW
-        # Keep only recent convergence records and suppress the same destination
-        # repeatedly firing while the same set of source worlds is still present.
+        sources = frozenset(convergence.sources)
+        already = False
         kept = deque(maxlen=self.convergences.maxlen)
+
         for item in self.convergences:
-            if item.timestamp >= cutoff:
-                kept.append(item)
-                if item.destination == convergence.destination and frozenset(item.sources) == current_sources:
-                    return True
+            if item.timestamp < cutoff:
+                continue
+            kept.append(item)
+            if (
+                item.destination == convergence.destination
+                and frozenset(item.sources) == sources
+            ):
+                already = True
+
         self.convergences = kept
-        return False
+        return already
+
 
     def is_watched(self, world):
         if not self.watch_enabled.get():
@@ -1323,6 +1494,8 @@ class App:
         self.movements.clear()
         self.convergences.clear()
         self.movement_history.clear()
+        self.movement_episodes.clear()
+        self.recent_movement_events.clear()
         self.chains.clear()
         self.alerts.clear()
         self.last_alert_signature.clear()
@@ -1409,13 +1582,27 @@ class PasswordWindow(tk.Tk):
         self.entry.pack(fill="x")
         self.entry.bind("<Return>", lambda _event: self.unlock())
 
+        contact_row = ttk.Frame(frame, style="Login.TFrame")
+        contact_row.pack(fill="x", pady=(8, 0))
+
         ttk.Label(
-            frame,
-            text="Need the password? Ask me on Discord: ____cooper_____",
+            contact_row,
+            text="Need the password? Contact me on Discord:",
             style="LoginText.TLabel",
-            wraplength=400,
-            justify="left",
-        ).pack(anchor="w", pady=(8, 0))
+        ).pack(side="left")
+
+        ttk.Label(
+            contact_row,
+            text="____cooper_____",
+            style="LoginText.TLabel",
+        ).pack(side="left", padx=(5, 8))
+
+        ttk.Button(
+            contact_row,
+            text="Copy",
+            width=7,
+            command=self.copy_discord_name,
+        ).pack(side="left")
 
         self.error = tk.StringVar()
         ttk.Label(
@@ -1453,6 +1640,15 @@ class PasswordWindow(tk.Tk):
         self.after(250, lambda: self.attributes("-topmost", False))
         self.after(50, self._focus_entry)
         self.grab_set()
+
+    def copy_discord_name(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append("____cooper_____")
+            self.error.set("Discord username copied.")
+            self.after(1800, lambda: self.error.set(""))
+        except tk.TclError:
+            self.error.set("Could not copy Discord username.")
 
     def _focus_entry(self):
         try:
