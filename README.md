@@ -1,4 +1,4 @@
-# Cake Powder / Faithful Few — OSRS World Tracker
+# Cake Powder — OSRS World Tracker
 
 Windows desktop prototype for tracking OSRS world populations and estimating possible group hops.
 
