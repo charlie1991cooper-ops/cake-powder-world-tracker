@@ -1,5 +1,4 @@
 import html
-import json
 import re
 import threading
 import time
@@ -17,11 +16,14 @@ except ImportError:
     winsound = None
 
 SOURCE_URL = "https://oldschool.runescape.com/slu"
-INTERVAL = 2
-MOVEMENT_WINDOW = 10
+POLL_INTERVAL = 2
+NORMAL_MATCH_WINDOW = 10
 CONVERGENCE_WINDOW = 30
 TEAM_HISTORY_SECONDS = 60 * 60
 MAX_TRACKED_MOVEMENT = 400
+EPISODE_MAX_SECONDS = 10
+EPISODE_QUIET_SECONDS = 4
+MAX_HISTORY_EVENTS = 500
 APP_NAME = "Cake's OSRS World Tracker"
 APP_PASSWORD = "1234"
 STARTUP_LOG = Path.home() / "cakes_osrs_tracker_startup.log"
@@ -47,6 +49,19 @@ class Change:
     def magnitude(self):
         return abs(self.amount)
 
+    @property
+    def direction(self):
+        return 1 if self.amount > 0 else -1
+
+    @property
+    def key(self):
+        return (
+            self.world,
+            self.amount,
+            round(self.start_time, 1),
+            round(self.end_time, 1),
+        )
+
 
 @dataclass(frozen=True)
 class Hop:
@@ -57,6 +72,12 @@ class Hop:
     moved: int
     score: int
     timestamp: float
+    source_event: tuple
+    destination_event: tuple
+
+    @property
+    def key(self):
+        return (self.source, self.destination, self.source_event, self.destination_event)
 
 
 @dataclass(frozen=True)
@@ -67,6 +88,8 @@ class Convergence:
     appeared: int
     score: int
     timestamp: float
+    destination_event: tuple
+    source_events: tuple
 
     @property
     def source_count(self):
@@ -76,18 +99,23 @@ class Convergence:
     def total_outflow(self):
         return sum(self.source_amounts)
 
+    @property
+    def key(self):
+        return (self.destination, tuple(sorted(self.sources)), self.destination_event)
+
 
 @dataclass(frozen=True)
-class WorldMovement:
+class WorldAlert:
     world: int
     delta: int
     score: int
     timestamp: float
+    context: str
     watched: bool = False
 
 
 class WorldParser(HTMLParser):
-    """Parse the official world list, using id=\"slu-world-XXX\" for real IDs."""
+    """Parse official world data and use id='slu-world-XXX' for the real ID."""
 
     def __init__(self):
         super().__init__()
@@ -111,8 +139,7 @@ class WorldParser(HTMLParser):
             self.in_cell = True
             self.cell_buf = []
         elif self.in_row and tag == "a":
-            ident = attrs.get("id", "")
-            match = re.fullmatch(r"slu-world-(\d+)", ident)
+            match = re.fullmatch(r"slu-world-(\d+)", attrs.get("id", ""))
             if match:
                 self.world_id = int(match.group(1))
 
@@ -139,7 +166,7 @@ class WorldParser(HTMLParser):
 def fetch_worlds():
     request = urllib.request.Request(
         SOURCE_URL,
-        headers={"User-Agent": "Cakes-OSRS-World-Tracker/7.0"},
+        headers={"User-Agent": "Cakes-OSRS-World-Tracker/8.0"},
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         raw = response.read().decode("utf-8", "replace")
@@ -150,20 +177,21 @@ def fetch_worlds():
     for world_id, row in parser.rows:
         if len(row) < 5:
             continue
-        players_match = re.search(r"([\d,]+)\s+players?", row[1], re.I)
-        if not players_match:
+        match = re.search(r"([\d,]+)\s+players?", row[1], re.I)
+        if not match:
             continue
-        players = int(players_match.group(1).replace(",", ""))
-        membership = row[3]
+        membership = row[3].strip()
         if membership not in ("Members", "Free"):
             continue
-        worlds.append(World(
-            world=world_id,
-            players=players,
-            location=row[2],
-            membership=membership,
-            activity=row[4] or "-",
-        ))
+        worlds.append(
+            World(
+                world=world_id,
+                players=int(match.group(1).replace(",", "")),
+                location=row[2].strip(),
+                membership=membership,
+                activity=row[4].strip() or "-",
+            )
+        )
 
     unique = {world.world: world for world in worlds}
     if not unique:
@@ -197,127 +225,142 @@ def likelihood_tag(score):
     return "unlikely"
 
 
-def build_movement_episode(episodes, previous, current, now, min_group):
-    """Turn many small polls into one movement episode per world."""
+def _new_episode(previous_population, step, now):
+    return {
+        "direction": 1 if step > 0 else -1,
+        "anchor": previous_population,
+        "start_time": now,
+        "last_nonzero": now,
+        "triggered": False,
+    }
+
+
+def build_movement_episodes(episodes, previous, current, now, min_group):
+    """Build one short movement episode at a time, instead of one event per poll.
+
+    An episode may accumulate over up to 10 seconds. Once the population is quiet
+    for four seconds, a new episode may begin even in the same direction. This
+    avoids both repeated alerts and permanently merging separate team movements.
+    """
     emitted = []
     min_group = max(1, min(MAX_TRACKED_MOVEMENT, int(min_group)))
 
     for world in set(previous) & set(current):
-        prev_pop = previous[world].players
-        cur_pop = current[world].players
-        step = cur_pop - prev_pop
+        prev_population = previous[world].players
+        current_population = current[world].players
+        step = current_population - prev_population
         state = episodes.get(world)
 
-        if state is None:
-            if step == 0:
-                continue
-            state = {
-                "direction": 1 if step > 0 else -1,
-                "anchor_population": prev_pop,
-                "start_time": now,
-                "triggered": False,
-            }
-            episodes[world] = state
-
-        net = cur_pop - state["anchor_population"]
-        direction = state["direction"]
-
-        # Once an episode crosses back through its anchor, begin a new episode.
-        if (direction > 0 and net < 0) or (direction < 0 and net > 0):
-            if step == 0:
-                episodes.pop(world, None)
-                continue
-            state = {
-                "direction": 1 if step > 0 else -1,
-                "anchor_population": prev_pop,
-                "start_time": now,
-                "triggered": False,
-            }
-            episodes[world] = state
-            net = cur_pop - state["anchor_population"]
-
-        if net == 0 and step == 0:
+        if state is not None and now - state["start_time"] > EPISODE_MAX_SECONDS:
+            state = None
             episodes.pop(world, None)
+
+        if step == 0:
+            if state is not None and now - state["last_nonzero"] >= EPISODE_QUIET_SECONDS:
+                episodes.pop(world, None)
             continue
 
+        if state is None:
+            state = _new_episode(prev_population, step, now)
+            episodes[world] = state
+        elif step * state["direction"] < 0:
+            state = _new_episode(prev_population, step, now)
+            episodes[world] = state
+        else:
+            state["last_nonzero"] = now
+
+        net = current_population - state["anchor"]
         if abs(net) > MAX_TRACKED_MOVEMENT:
             episodes.pop(world, None)
             continue
 
-        if abs(net) >= min_group and not state["triggered"]:
+        if not state["triggered"] and abs(net) >= min_group:
             state["triggered"] = True
-            emitted.append(Change(world, net, state["start_time"], now))
+            emitted.append(
+                Change(
+                    world=world,
+                    amount=net,
+                    start_time=state["start_time"],
+                    end_time=now,
+                )
+            )
 
     return emitted
 
 
-def score_hop(source, destination, now):
-    """Score one inferred source -> destination movement."""
+def score_hop(source, destination):
     age = abs(source.end_time - destination.end_time)
-    if age > MOVEMENT_WINDOW:
+    if age > NORMAL_MATCH_WINDOW:
         return 0
 
     ratio = ratio_score(source.magnitude, destination.magnitude)
-    timing = 1.0 - age / MOVEMENT_WINDOW
+    timing = 1.0 - age / NORMAL_MATCH_WINDOW
     size = max(source.magnitude, destination.magnitude)
 
-    score = (
-        44.0 * ratio
-        + 34.0 * timing
-        + min(22.0, size / 25.0 * 22.0)
-    )
+    score = 46 * ratio + 34 * timing + min(20, size / 25 * 20)
     if ratio < 0.50:
-        score -= 20
+        score -= 22
     elif ratio < 0.65:
         score -= 12
     elif ratio < 0.80:
-        score -= 6
-    if size <= 6:
         score -= 5
+    if size <= 6:
+        score -= 4
     return min(99, max(0, round(score)))
 
 
-def match_movement_events(drops, gains, now, min_group):
-    """Globally match distinct movement episodes inside the 10-second window."""
+def match_movement_events(events, now, min_group):
+    """Globally match unique drop/gain events inside the rolling 10-second window."""
+    cutoff = now - NORMAL_MATCH_WINDOW
     min_group = max(1, min(MAX_TRACKED_MOVEMENT, int(min_group)))
-    drops = [d for d in drops if d.end_time >= now - MOVEMENT_WINDOW and d.magnitude >= min_group]
-    gains = [g for g in gains if g.end_time >= now - MOVEMENT_WINDOW and g.magnitude >= min_group]
+    drops = [e for e in events if e.end_time >= cutoff and e.amount <= -min_group]
+    gains = [e for e in events if e.end_time >= cutoff and e.amount >= min_group]
 
     candidates = []
     for source in drops:
         for destination in gains:
             if source.world == destination.world:
                 continue
-            score = score_hop(source, destination, now)
+            score = score_hop(source, destination)
             if score >= 45:
                 candidates.append((score, source, destination))
 
-    candidates.sort(key=lambda item: (item[0], min(item[1].magnitude, item[2].magnitude)), reverse=True)
+    candidates.sort(
+        key=lambda item: (
+            item[0],
+            min(item[1].magnitude, item[2].magnitude),
+            -abs(item[1].end_time - item[2].end_time),
+        ),
+        reverse=True,
+    )
+
     used_sources = set()
     used_destinations = set()
     results = []
-
     for score, source, destination in candidates:
-        if source.world in used_sources or destination.world in used_destinations:
+        if source.key in used_sources or destination.key in used_destinations:
             continue
-        results.append(Hop(
-            source=source.world,
-            destination=destination.world,
-            left=source.magnitude,
-            appeared=destination.magnitude,
-            moved=max(source.magnitude, destination.magnitude),
-            score=score,
-            timestamp=max(source.end_time, destination.end_time),
-        ))
-        used_sources.add(source.world)
-        used_destinations.add(destination.world)
-
+        results.append(
+            Hop(
+                source=source.world,
+                destination=destination.world,
+                left=source.magnitude,
+                appeared=destination.magnitude,
+                moved=max(source.magnitude, destination.magnitude),
+                score=score,
+                timestamp=max(source.end_time, destination.end_time),
+                source_event=source.key,
+                destination_event=destination.key,
+            )
+        )
+        used_sources.add(source.key)
+        used_destinations.add(destination.key)
     return results
 
 
-def detect_convergences(events, timestamp, min_group):
-    """Find multiple source-world outflows converging on one destination."""
-    cutoff = timestamp - CONVERGENCE_WINDOW
+def detect_convergences(events, now, min_group):
+    """Detect 2+ source worlds feeding one destination inside 30 seconds."""
+    cutoff = now - CONVERGENCE_WINDOW
     min_group = max(1, min(MAX_TRACKED_MOVEMENT, int(min_group)))
     recent = [e for e in events if e.end_time >= cutoff and e.magnitude <= MAX_TRACKED_MOVEMENT]
     drops = [e for e in recent if e.amount <= -min_group]
@@ -325,7 +368,7 @@ def detect_convergences(events, timestamp, min_group):
     results = []
 
     for destination in gains:
-        choices = []
+        candidates = []
         for source in drops:
             if source.world == destination.world:
                 continue
@@ -333,75 +376,90 @@ def detect_convergences(events, timestamp, min_group):
             if age > CONVERGENCE_WINDOW:
                 continue
             ratio = ratio_score(source.magnitude, destination.magnitude)
-            timing = 1.0 - age / CONVERGENCE_WINDOW
-            quality = ratio * 0.65 + timing * 0.35
-            choices.append((quality, source, ratio, timing))
+            timing = 1 - age / CONVERGENCE_WINDOW
+            quality = ratio * 0.60 + timing * 0.40
+            candidates.append((quality, source, ratio, timing))
 
         best_by_world = {}
-        for quality, source, ratio, timing in choices:
-            current = best_by_world.get(source.world)
-            if current is None or quality > current[0]:
-                best_by_world[source.world] = (quality, source, ratio, timing)
+        for candidate in candidates:
+            quality, source, ratio, timing = candidate
+            old = best_by_world.get(source.world)
+            if old is None or quality > old[0]:
+                best_by_world[source.world] = candidate
 
-        chosen = sorted(best_by_world.values(), key=lambda item: (item[0], item[1].magnitude), reverse=True)[:6]
+        chosen = sorted(
+            best_by_world.values(),
+            key=lambda item: (item[0], item[1].magnitude),
+            reverse=True,
+        )[:6]
         if len(chosen) < 2:
             continue
 
         sizes = [item[1].magnitude for item in chosen]
-        median_size = sorted(sizes)[len(sizes) // 2]
-        consistency = 1.0 - sum(abs(size - median_size) for size in sizes) / max(1, sum(sizes))
+        median = sorted(sizes)[len(sizes) // 2]
+        consistency = 1 - sum(abs(size - median) for size in sizes) / max(1, sum(sizes))
         avg_ratio = sum(item[2] for item in chosen) / len(chosen)
         avg_timing = sum(item[3] for item in chosen) / len(chosen)
+        coverage = destination.magnitude / max(1, sum(sizes))
+
         score = (
-            42
-            + 23 * avg_ratio
-            + 18 * avg_timing
-            + 20 * max(0.0, min(1.0, consistency))
-            + min(24, (len(chosen) - 2) * 12)
+            25
+            + 25 * avg_ratio
+            + 20 * avg_timing
+            + 12 * max(0.0, min(1.0, consistency))
+            + min(15, (len(chosen) - 1) * 7)
+            + min(7, coverage * 7)
         )
         if len(chosen) >= 3:
-            score += 8
-        if len(chosen) >= 4:
             score += 6
+        return_score = min(99, max(0, round(score)))
 
-        result = Convergence(
-            destination=destination.world,
-            sources=tuple(item[1].world for item in chosen),
-            source_amounts=tuple(item[1].magnitude for item in chosen),
-            appeared=destination.magnitude,
-            score=min(99, max(0, round(score))),
-            timestamp=max([destination.end_time] + [item[1].end_time for item in chosen]),
+        results.append(
+            Convergence(
+                destination=destination.world,
+                sources=tuple(item[1].world for item in chosen),
+                source_amounts=tuple(item[1].magnitude for item in chosen),
+                appeared=destination.magnitude,
+                score=return_score,
+                timestamp=max([destination.end_time] + [item[1].end_time for item in chosen]),
+                destination_event=destination.key,
+                source_events=tuple(item[1].key for item in chosen),
+            )
         )
-        results.append(result)
 
     best = {}
     for result in results:
         existing = best.get(result.destination)
         if existing is None or result.score > existing.score:
             best[result.destination] = result
-    return sorted(best.values(), key=lambda result: (result.score, result.source_count), reverse=True)
+    return sorted(best.values(), key=lambda item: (item.score, item.source_count), reverse=True)
 
 
 class TeamTrack:
-    """A persistent inferred team remembered for up to one hour."""
+    """Persistent inferred team state remembered for up to one hour."""
 
     def __init__(self, *, first_hop=None, convergence=None):
+        self.route_worlds = []
         self.hops = []
         self.last_world = None
         self.last_time = 0.0
-        self.created_time = time.time()
-        self.seed_text = ""
         self.approx_size = 0
+        self.seed_confidence = 0
+        self.seed_sources = ()
+
         if first_hop is not None:
-            self.hops.append(first_hop)
+            self.route_worlds = [first_hop.source, first_hop.destination]
+            self.hops = [first_hop]
             self.last_world = first_hop.destination
             self.last_time = first_hop.timestamp
             self.approx_size = first_hop.moved
         elif convergence is not None:
+            self.route_worlds = [convergence.destination]
             self.last_world = convergence.destination
             self.last_time = convergence.timestamp
             self.approx_size = convergence.appeared
-            self.seed_text = " + ".join(map(str, convergence.sources)) + f" → {convergence.destination}"
+            self.seed_confidence = convergence.score
+            self.seed_sources = convergence.sources
 
     @property
     def age(self):
@@ -409,62 +467,72 @@ class TeamTrack:
 
     @property
     def hop_count(self):
-        return len(self.hops) + (1 if self.seed_text else 0)
+        return len(self.hops)
 
     @property
     def route(self):
-        if self.seed_text:
-            tail = [self.last_world]
-            for hop in self.hops:
-                tail.append(hop.destination)
-            return [self.seed_text] if not self.hops else [self.seed_text] + tail[1:]
-        if not self.hops:
-            return []
-        return [self.hops[0].source] + [hop.destination for hop in self.hops]
+        return list(self.route_worlds)
 
     @property
     def size(self):
+        if not self.hops:
+            return max(1, self.approx_size)
         values = [hop.moved for hop in self.hops[-8:]]
-        if self.seed_text and self.approx_size:
+        if self.approx_size:
             values.append(self.approx_size)
-        return max(1, round(sum(values) / len(values))) if values else max(1, self.approx_size)
+        return max(1, round(sum(values) / len(values)))
 
     @property
     def score(self):
-        hop_scores = [hop.score for hop in self.hops[-8:]]
-        base = sum(hop_scores) / len(hop_scores) if hop_scores else 68
-        consistency = 1.0
+        if not self.hops:
+            return min(99, max(50, self.seed_confidence))
+        scores = [hop.score for hop in self.hops[-8:]]
+        base = sum(scores) / len(scores)
         values = [hop.moved for hop in self.hops[-8:]]
+        consistency = 1.0
         if len(values) > 1:
             mean = sum(values) / len(values)
-            deviation = sum(abs(v - mean) for v in values) / len(values)
+            deviation = sum(abs(value - mean) for value in values) / len(values)
             consistency = max(0.0, 1.0 - deviation / max(1, mean))
-        repeat_bonus = min(30, max(0, len(self.hops) - 1) * 8)
-        seed_bonus = 12 if self.seed_text else 0
-        return min(99, max(0, round(base * 0.68 + consistency * 14 + repeat_bonus + seed_bonus)))
+        repeat_bonus = min(28, max(0, len(self.hops) - 1) * 8)
+        seed_bonus = min(15, max(0, self.seed_confidence - 70) // 2) if self.seed_confidence else 0
+        return min(99, max(0, round(base * 0.70 + consistency * 14 + repeat_bonus + seed_bonus)))
 
     def is_alive(self):
-        return self.last_time > 0 and (time.time() - self.last_time) <= TEAM_HISTORY_SECONDS
+        return self.last_time > 0 and time.time() - self.last_time <= TEAM_HISTORY_SECONDS
 
     def can_extend(self, hop):
         if not self.is_alive() or hop.source != self.last_world:
             return False
         expected = max(1, self.size)
         ratio = hop.moved / expected
-        return 0.35 <= ratio <= 1.65
+        return 0.35 <= ratio <= 1.80
 
     def add(self, hop):
         self.hops.append(hop)
         self.last_world = hop.destination
         self.last_time = hop.timestamp
         self.approx_size = hop.moved
+        if not self.route_worlds:
+            self.route_worlds = [hop.source]
+        if self.route_worlds[-1] != hop.destination:
+            self.route_worlds.append(hop.destination)
+
+    def reinforce(self, convergence):
+        if convergence.destination != self.last_world:
+            return False
+        self.approx_size = round((self.size + convergence.appeared) / 2)
+        self.seed_confidence = max(self.seed_confidence, convergence.score)
+        self.seed_sources = convergence.sources
+        self.last_time = max(self.last_time, convergence.timestamp)
+        return True
 
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_NAME)
-        root.geometry("1280x760")
+        root.geometry("1250x760")
         root.minsize(1050, 650)
         root.configure(bg="#0b1018")
 
@@ -478,15 +546,15 @@ class App:
         self.worlds = []
         self.previous = None
         self.movement_episodes = {}
-        self.recent_events = deque(maxlen=500)
-        self.movement_history = deque(maxlen=500)
+        self.recent_events = deque(maxlen=MAX_HISTORY_EVENTS)
+        self.movement_history = deque(maxlen=MAX_HISTORY_EVENTS)
         self.hops = deque(maxlen=250)
         self.convergences = deque(maxlen=150)
         self.teams = []
-        self.alerts = deque(maxlen=250)
+        self.alerts = deque(maxlen=500)
         self.delta_noise = defaultdict(lambda: deque(maxlen=24))
-        self.last_hop_reported = {}
-        self.last_convergence_reported = {}
+        self.reported_hops = {}
+        self.reported_convergences = {}
         self.fetch_in_progress = False
         self.fetch_failures = 0
         self.last_fetch_started = 0.0
@@ -494,15 +562,15 @@ class App:
         self.f2p = tk.BooleanVar(value=False)
         self.min_group = tk.IntVar(value=10)
         self.min_conf = tk.IntVar(value=50)
+        self.world_alert_threshold = tk.IntVar(value=10)
         self.watch_enabled = tk.BooleanVar(value=False)
         self.watch_world = tk.StringVar(value="")
         self.watch_threshold = tk.IntVar(value=10)
-        self.world_alert_threshold = tk.IntVar(value=10)
         self.sound_alerts = tk.BooleanVar(value=False)
 
         self.view = "teams"
         self.status = tk.StringVar(value="Starting…")
-        self.detail = tk.StringVar(value="Waiting for first world snapshot.")
+        self.detail = tk.StringVar(value="Waiting for the first world snapshot.")
         self.alert_banner = tk.StringVar(value="No alerts yet")
 
         self.build_ui()
@@ -529,20 +597,20 @@ class App:
         style.configure("Modern.Vertical.TScrollbar", background="#182235", troughcolor="#0b1018", bordercolor="#0b1018", arrowcolor="#91a0b5")
 
     def build_ui(self):
-        header = ttk.Frame(self.root, padding=(18, 14, 18, 8))
+        header = ttk.Frame(self.root, padding=(18, 14, 18, 7))
         header.pack(fill="x")
         ttk.Label(header, text=APP_NAME, style="Header.TLabel").pack(side="left")
         ttk.Label(header, textvariable=self.status, style="Status.TLabel").pack(side="right")
 
-        controls = ttk.Frame(self.root, padding=(18, 2, 18, 10))
+        controls = ttk.Frame(self.root, padding=(18, 0, 18, 9))
         controls.pack(fill="x")
-        ttk.Label(controls, text="Group size ≥").pack(side="left")
-        ttk.Spinbox(controls, from_=1, to=400, textvariable=self.min_group, width=5).pack(side="left", padx=(5, 14))
+        ttk.Label(controls, text="Group ≥").pack(side="left")
+        ttk.Spinbox(controls, from_=1, to=400, textvariable=self.min_group, width=5).pack(side="left", padx=(5, 12))
         ttk.Label(controls, text="Show").pack(side="left")
         self.conf_combo = ttk.Combobox(controls, values=("Possible", "Likely", "Very likely"), state="readonly", width=11)
         self.conf_combo.current(0)
-        self.conf_combo.pack(side="left", padx=(5, 14))
         self.conf_combo.bind("<<ComboboxSelected>>", self.conf_changed)
+        self.conf_combo.pack(side="left", padx=(5, 12))
         ttk.Checkbutton(controls, text="F2P", variable=self.f2p, command=self.reset_baseline).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(controls, text="Sound", variable=self.sound_alerts).pack(side="left")
         ttk.Button(controls, text="Settings", command=self.open_settings).pack(side="right", padx=(7, 0))
@@ -552,8 +620,14 @@ class App:
         body.pack(fill="both", expand=True)
 
         nav = ttk.Frame(body)
-        nav.pack(fill="x", pady=(0, 8))
-        for text, view in (("Active Teams", "teams"), ("Mass Hops", "hops"), ("Convergences", "convergences"), ("Worlds", "worlds"), ("Alerts", "alerts")):
+        nav.pack(fill="x", pady=(0, 7))
+        for text, view in (
+            ("Active Teams", "teams"),
+            ("Mass Hops", "hops"),
+            ("Convergences", "convergences"),
+            ("Worlds", "worlds"),
+            ("World Alerts", "alerts"),
+        ):
             ttk.Button(nav, text=text, command=lambda v=view: self.set_view(v)).pack(side="left", padx=(0, 5))
         ttk.Label(nav, textvariable=self.alert_banner, foreground="#b477ff").pack(side="right")
 
@@ -568,17 +642,19 @@ class App:
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self.select_row)
-        for tag, foreground in (("very", "#39e58c"), ("likely", "#e8d44d"), ("possible", "#ff9d32"), ("unlikely", "#ff5964")):
-            self.tree.tag_configure(tag, foreground=foreground)
+        self.tree.tag_configure("very", foreground="#39e58c")
+        self.tree.tag_configure("likely", foreground="#e8d44d")
+        self.tree.tag_configure("possible", foreground="#ff9d32")
+        self.tree.tag_configure("unlikely", foreground="#ff5964")
         self.tree.tag_configure("watch", background="#241a3d")
 
-        ttk.Label(body, textvariable=self.detail, wraplength=1100, foreground="#8d9ab0").pack(anchor="w", pady=(8, 0))
+        ttk.Label(body, textvariable=self.detail, wraplength=1120, foreground="#8d9ab0").pack(anchor="w", pady=(8, 0))
         self.set_view("teams")
 
     def open_settings(self):
         win = tk.Toplevel(self.root)
         win.title("Tracker Settings")
-        win.geometry("400x470")
+        win.geometry("390x455")
         win.resizable(False, False)
         win.configure(bg="#0b1018")
         win.transient(self.root)
@@ -586,7 +662,7 @@ class App:
         frame = ttk.Frame(win, padding=18)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="TRACKER SETTINGS", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="These settings affect detection sensitivity only.", foreground="#8d9ab0").pack(anchor="w", pady=(4, 14))
+        ttk.Label(frame, text="Detection thresholds are independent so the views remain consistent.", foreground="#8d9ab0", wraplength=340).pack(anchor="w", pady=(4, 14))
 
         ttk.Label(frame, text="Minimum group size").pack(anchor="w")
         ttk.Spinbox(frame, from_=1, to=400, textvariable=self.min_group, width=8).pack(anchor="w", pady=(3, 12))
@@ -597,47 +673,46 @@ class App:
         combo.bind("<<ComboboxSelected>>", lambda _e: self.conf_changed_from(combo))
         combo.pack(anchor="w", pady=(3, 12))
 
-        ttk.Label(frame, text="Unmatched world alert threshold").pack(anchor="w")
+        ttk.Label(frame, text="World Alerts threshold").pack(anchor="w")
         ttk.Spinbox(frame, from_=1, to=400, textvariable=self.world_alert_threshold, width=8).pack(anchor="w", pady=(3, 12))
+        ttk.Label(frame, text="Any qualifying movement appears here, including movements that were successfully matched to a hop.", foreground="#8d9ab0", wraplength=340).pack(anchor="w", pady=(0, 12))
 
         ttk.Checkbutton(frame, text="Watch a specific world", variable=self.watch_enabled, command=self.redraw).pack(anchor="w", pady=(2, 5))
         ttk.Label(frame, text="World").pack(anchor="w")
         self.settings_watch_combo = ttk.Combobox(frame, textvariable=self.watch_world, state="normal", width=12)
         self.settings_watch_combo.pack(anchor="w", pady=(3, 5))
-        ttk.Label(frame, text="Watched-world alert threshold").pack(anchor="w")
+        ttk.Label(frame, text="Watched-world threshold").pack(anchor="w")
         ttk.Spinbox(frame, from_=1, to=400, textvariable=self.watch_threshold, width=8).pack(anchor="w", pady=(3, 15))
 
         ttk.Button(frame, text="Clear history", command=lambda: (self.clear_history(), win.destroy())).pack(anchor="w", pady=(4, 8))
         ttk.Button(frame, text="Close", command=win.destroy).pack(anchor="e")
-
         self.update_watch_list()
 
     def conf_changed_from(self, combo):
-        text = combo.get()
-        self.min_conf.set(50 if text == "Possible" else 75 if text == "Likely" else 90)
+        self.min_conf.set(50 if combo.get() == "Possible" else 75 if combo.get() == "Likely" else 90)
         self.redraw()
 
     def conf_changed(self, _event=None):
-        text = self.conf_combo.get()
-        self.min_conf.set(50 if text == "Possible" else 75 if text == "Likely" else 90)
+        self.min_conf.set(50 if self.conf_combo.get() == "Possible" else 75 if self.conf_combo.get() == "Likely" else 90)
         self.redraw()
 
     def visible_worlds(self):
-        return self.worlds if self.f2p.get() else [w for w in self.worlds if w.membership == "Members"]
+        if self.f2p.get():
+            return list(self.worlds)
+        return [world for world in self.worlds if world.membership == "Members"]
 
     def update_watch_list(self):
         if not hasattr(self, "settings_watch_combo"):
             return
-        values = [str(world.world) for world in self.visible_worlds()]
-        self.settings_watch_combo["values"] = values
+        self.settings_watch_combo["values"] = [str(world.world) for world in self.visible_worlds()]
 
     def reset_baseline(self):
         self.previous = None
         self.movement_episodes.clear()
         self.recent_events.clear()
         self.movement_history.clear()
-        self.last_hop_reported.clear()
-        self.last_convergence_reported.clear()
+        self.reported_hops.clear()
+        self.reported_convergences.clear()
         self.detail.set("Baseline reset. Waiting for the next snapshot.")
         self.redraw()
 
@@ -651,38 +726,40 @@ class App:
             "alerts": "WORLD ALERTS",
         }
         columns = {
-            "teams": ("status", "route", "size", "hops", "confidence", "last"),
+            "teams": ("status", "route", "group", "hops", "confidence", "last"),
             "hops": ("from", "to", "left", "appeared", "group", "confidence", "time"),
             "convergences": ("sources", "to", "appeared", "outflow", "confidence", "time"),
             "worlds": ("world", "players", "type", "location", "activity"),
-            "alerts": ("world", "direction", "change", "confidence", "time"),
+            "alerts": ("world", "direction", "change", "context", "confidence", "time"),
         }
         names = {
-            "status": "STATUS", "route": "ROUTE", "size": "GROUP", "hops": "HOPS", "confidence": "CONFIDENCE", "last": "LAST",
-            "from": "FROM", "to": "TO", "left": "LEFT", "appeared": "APPEARED", "group": "EST. GROUP", "time": "TIME",
+            "status": "STATUS", "route": "ROUTE", "group": "GROUP", "hops": "HOPS", "confidence": "CONFIDENCE", "last": "LAST",
+            "from": "FROM", "to": "TO", "left": "LEFT", "appeared": "APPEARED", "time": "TIME",
             "sources": "SOURCE WORLDS", "outflow": "SOURCE OUTFLOW", "world": "WORLD", "players": "PLAYERS", "type": "TYPE", "location": "LOCATION", "activity": "ACTIVITY",
-            "direction": "DIRECTION", "change": "CHANGE",
+            "direction": "DIRECTION", "change": "CHANGE", "context": "CONTEXT",
         }
         self.view_title.config(text=titles[view])
         self.tree["columns"] = columns[view]
         for col in columns[view]:
             self.tree.heading(col, text=names[col])
             self.tree.column(col, width=120, anchor="center")
+
         widths = {
-            "teams": (("status", 85), ("route", 500), ("size", 90), ("hops", 70), ("confidence", 120), ("last", 90)),
-            "hops": (("from", 75), ("to", 75), ("left", 90), ("appeared", 100), ("group", 100), ("confidence", 120), ("time", 90)),
-            "convergences": (("sources", 380), ("to", 75), ("appeared", 100), ("outflow", 125), ("confidence", 120), ("time", 90)),
+            "teams": (("status", 80), ("route", 480), ("group", 90), ("hops", 70), ("confidence", 125), ("last", 90)),
+            "hops": (("from", 75), ("to", 75), ("left", 90), ("appeared", 100), ("group", 100), ("confidence", 125), ("time", 90)),
+            "convergences": (("sources", 390), ("to", 75), ("appeared", 105), ("outflow", 130), ("confidence", 125), ("time", 90)),
             "worlds": (("world", 80), ("players", 100), ("type", 90), ("location", 170), ("activity", 450)),
-            "alerts": (("world", 80), ("direction", 100), ("change", 90), ("confidence", 120), ("time", 90)),
+            "alerts": (("world", 75), ("direction", 95), ("change", 85), ("context", 290), ("confidence", 125), ("time", 90)),
         }
         for col, width in widths[view]:
             self.tree.column(col, width=width)
+
         explanations = {
-            "teams": "Teams are inferred from repeated group-sized hops and convergence patterns, then remembered for one hour.",
-            "hops": "A mass hop is a matched population drop and rise observed within 10 seconds.",
-            "convergences": "Two or more source worlds lose group-sized populations toward the same destination within 30 seconds.",
+            "teams": "Persistent inferred teams. A team can return to a previous world and is remembered for one hour after its latest evidence.",
+            "hops": "Matched population movements. Source and destination events are drawn from the same underlying movement records used by World Alerts.",
+            "convergences": "Two or more source worlds lose group-sized populations around the same time while one destination gains players.",
             "worlds": "Current official OSRS world population snapshot.",
-            "alerts": "Unmatched unusual population movements and watched-world changes.",
+            "alerts": "Every qualifying world movement appears here, whether or not it was matched to a hop or convergence.",
         }
         self.detail.set(explanations[view])
         self.redraw()
@@ -704,11 +781,10 @@ class App:
 
     def fetch_failed(self, message):
         self.fetch_in_progress = False
-        self.fetch_failures = min(self.fetch_failures + 1, 5)
+        self.fetch_failures = min(5, self.fetch_failures + 1)
         self.status.set("Update failed; retrying…")
         self.detail.set(f"Could not update world data: {message}")
-        delay = int(min(20, 2 ** self.fetch_failures) * 1000)
-        self.root.after(delay, self.refresh)
+        self.root.after(int(min(20, 2 ** self.fetch_failures) * 1000), self.refresh)
 
     def apply_worlds(self, worlds):
         self.fetch_in_progress = False
@@ -716,8 +792,8 @@ class App:
         self.worlds = worlds
         current = {world.world: world for world in self.visible_worlds()}
         now = time.time()
-        min_group = max(1, min(MAX_TRACKED_MOVEMENT, self.min_group.get()))
-        self.min_group.set(min_group)
+
+        self.min_group.set(max(1, min(MAX_TRACKED_MOVEMENT, self.min_group.get())))
         self.world_alert_threshold.set(max(1, min(MAX_TRACKED_MOVEMENT, self.world_alert_threshold.get())))
         self.watch_threshold.set(max(1, min(MAX_TRACKED_MOVEMENT, self.watch_threshold.get())))
 
@@ -726,50 +802,66 @@ class App:
             self.update_watch_list()
             self.status.set(f"Baseline captured • {len(current)} worlds")
         else:
-            new_events = build_movement_episode(self.movement_episodes, self.previous, current, now, min_group)
+            min_group = self.min_group.get()
+            new_events = build_movement_episodes(self.movement_episodes, self.previous, current, now, min_group)
             for event in new_events:
                 self.recent_events.append(event)
                 self.movement_history.append(event)
-            self.recent_events = self.prune_events(self.recent_events, now, MOVEMENT_WINDOW)
+
+            self.recent_events = self.prune_events(self.recent_events, now, NORMAL_MATCH_WINDOW)
             self.movement_history = self.prune_events(self.movement_history, now, CONVERGENCE_WINDOW)
 
-            drops = [event for event in self.recent_events if event.amount < 0]
-            gains = [event for event in self.recent_events if event.amount > 0]
-            hops = match_movement_events(drops, gains, now, min_group)
-            hops = [hop for hop in hops if not self.hop_recently_reported(hop.source, hop.destination, now)]
+            hops = match_movement_events(self.recent_events, now, min_group)
+            hops = [hop for hop in hops if not self.hop_recently_reported(hop, now)]
             convergences = detect_convergences(self.movement_history, now, min_group)
+            convergences = [item for item in convergences if not self.convergence_recently_reported(item, now)]
 
-            matched_worlds = {hop.source for hop in hops} | {hop.destination for hop in hops}
-            convergence_worlds = set()
+            matched_event_keys = set()
+            convergence_event_keys = set()
+            hop_event_keys = set()
 
             for hop in hops:
-                if hop.score < self.min_conf.get():
-                    continue
-                self.hops.appendleft(hop)
-                self.attach_hop_to_team(hop)
-                matched_worlds.add(hop.source)
-                matched_worlds.add(hop.destination)
+                hop_event_keys.add(hop.source_event)
+                hop_event_keys.add(hop.destination_event)
+                matched_event_keys.add(hop.source_event)
+                matched_event_keys.add(hop.destination_event)
+                if hop.score >= self.min_conf.get():
+                    self.hops.appendleft(hop)
+                    self.attach_hop_to_team(hop)
 
             for convergence in convergences:
-                if convergence.score < self.min_conf.get():
-                    continue
-                if self.convergence_recently_reported(convergence, now):
-                    continue
-                self.convergences.appendleft(convergence)
-                convergence_worlds.update(convergence.sources)
-                convergence_worlds.add(convergence.destination)
-                self.attach_convergence_to_team(convergence)
-                self.raise_banner(
-                    f"{convergence.source_count} WORLDS → {convergence.destination} • +{convergence.appeared} • {likelihood_label(convergence.score)}"
-                )
+                convergence_event_keys.add(convergence.destination_event)
+                convergence_event_keys.update(convergence.source_events)
+                if convergence.score >= self.min_conf.get():
+                    self.convergences.appendleft(convergence)
+                    self.attach_convergence_to_team(convergence)
+                    self.raise_banner(
+                        f"{convergence.source_count} WORLDS → {convergence.destination} • +{convergence.appeared} • {likelihood_label(convergence.score)}"
+                    )
 
+            # Authoritative alert feed: every qualifying movement is represented,
+            # even when it also participates in a successful hop/convergence.
             for event in new_events:
-                if event.world in matched_worlds or event.world in convergence_worlds:
-                    continue
-                movement = self.make_world_alert(event, now)
-                if movement is not None:
-                    self.alerts.appendleft(movement)
+                context_parts = []
+                if event.key in hop_event_keys:
+                    context_parts.append("MASS HOP")
+                if event.key in convergence_event_keys:
+                    context_parts.append("CONVERGENCE")
+                watched = self.is_watched(event.world) and event.magnitude >= self.watch_threshold.get()
+                if watched:
+                    context_parts.append("WATCHED WORLD")
+                if not context_parts:
+                    context_parts.append("UNMATCHED MOVEMENT")
 
+                if event.magnitude >= self.world_alert_threshold.get() or watched:
+                    alert = self.make_world_alert(event, now, " + ".join(context_parts), watched)
+                    self.alerts.appendleft(alert)
+                    if watched or not context_parts == ["UNMATCHED MOVEMENT"]:
+                        self.raise_banner(
+                            f"World {event.world} {'INFLUX' if event.amount > 0 else 'OUTFLOW'} {event.magnitude} • {' + '.join(context_parts)}"
+                        )
+
+            # Learn only from immediate polling noise, not from multi-second movement episodes.
             for world in set(self.previous) & set(current):
                 delta = current[world].players - self.previous[world].players
                 if abs(delta) <= MAX_TRACKED_MOVEMENT:
@@ -782,35 +874,34 @@ class App:
 
         self.redraw()
         elapsed = max(0.0, time.time() - self.last_fetch_started)
-        self.root.after(max(700, int(INTERVAL * 1000 - elapsed * 1000)), self.refresh)
+        delay_ms = max(700, int(POLL_INTERVAL * 1000 - elapsed * 1000))
+        self.root.after(delay_ms, self.refresh)
 
     @staticmethod
     def prune_events(events, now, window_seconds):
         cutoff = now - window_seconds
-        return deque((event for event in events if event.end_time >= cutoff), maxlen=500)
+        return deque((event for event in events if event.end_time >= cutoff), maxlen=MAX_HISTORY_EVENTS)
 
-    def hop_recently_reported(self, source, destination, now, window_seconds=20):
-        cutoff = now - window_seconds
-        for key, stamp in list(self.last_hop_reported.items()):
+    def hop_recently_reported(self, hop, now):
+        key = (hop.source, hop.destination, hop.source_event, hop.destination_event)
+        cutoff = now - NORMAL_MATCH_WINDOW
+        for stored_key, stamp in list(self.reported_hops.items()):
             if stamp < cutoff:
-                self.last_hop_reported.pop(key, None)
-        key = (source, destination)
-        previous = self.last_hop_reported.get(key)
-        if previous is not None and now - previous < window_seconds:
+                self.reported_hops.pop(stored_key, None)
+        if key in self.reported_hops:
             return True
-        self.last_hop_reported[key] = now
+        self.reported_hops[key] = now
         return False
 
     def convergence_recently_reported(self, convergence, now):
         cutoff = now - CONVERGENCE_WINDOW
-        for key, stamp in list(self.last_convergence_reported.items()):
+        for stored_key, stamp in list(self.reported_convergences.items()):
             if stamp < cutoff:
-                self.last_convergence_reported.pop(key, None)
-        key = (convergence.destination, tuple(sorted(convergence.sources)))
-        previous = self.last_convergence_reported.get(key)
-        if previous is not None and now - previous < CONVERGENCE_WINDOW:
+                self.reported_convergences.pop(stored_key, None)
+        key = (convergence.destination, tuple(sorted(convergence.sources)), convergence.destination_event)
+        if key in self.reported_convergences:
             return True
-        self.last_convergence_reported[key] = now
+        self.reported_convergences[key] = now
         return False
 
     def attach_hop_to_team(self, hop):
@@ -819,44 +910,55 @@ class App:
         if candidates:
             candidates.sort(key=lambda team: (abs(team.size - hop.moved), team.age))
             candidates[0].add(hop)
-            return
-        self.teams.insert(0, TeamTrack(first_hop=hop))
-        self.teams = self.teams[:100]
+        else:
+            self.teams.insert(0, TeamTrack(first_hop=hop))
+            self.teams = self.teams[:100]
 
     def attach_convergence_to_team(self, convergence):
         self.teams = [team for team in self.teams if team.is_alive()]
-        candidates = [team for team in self.teams if team.last_world == convergence.destination]
+        candidates = []
+        for team in self.teams:
+            if team.last_world != convergence.destination:
+                continue
+            ratio = convergence.appeared / max(1, team.size)
+            if 0.35 <= ratio <= 1.80:
+                candidates.append((abs(team.size - convergence.appeared), team.age, team))
         if candidates:
-            candidates.sort(key=lambda team: (abs(team.size - convergence.appeared), team.age))
-            best = candidates[0]
-            # A convergence onto the team's current world reinforces the same team rather than creating a duplicate.
-            best.approx_size = round((best.size + convergence.appeared) / 2)
-            best.last_time = convergence.timestamp
-            return
-        self.teams.insert(0, TeamTrack(convergence=convergence))
-        self.teams = self.teams[:100]
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            candidates[0][2].reinforce(convergence)
+        else:
+            self.teams.insert(0, TeamTrack(convergence=convergence))
+            self.teams = self.teams[:100]
 
     def expire_teams(self):
         self.teams = [team for team in self.teams if team.is_alive()]
 
-    def make_world_alert(self, event, now):
-        threshold = max(1, min(MAX_TRACKED_MOVEMENT, self.world_alert_threshold.get()))
-        watched = False
+    def is_watched(self, world):
+        if not self.watch_enabled.get():
+            return False
         try:
-            watched_world = int(self.watch_world.get()) if self.watch_enabled.get() else None
-        except ValueError:
-            watched_world = None
-        if watched_world == event.world and event.magnitude >= self.watch_threshold.get():
-            watched = True
-        if event.magnitude < threshold and not watched:
-            return None
-        noise_values = self.delta_noise[event.world]
-        baseline = sum(noise_values) / len(noise_values) if noise_values else 0.0
-        scale = max(3.0, threshold, baseline * 2.5)
-        score = 45 + min(45, event.magnitude / scale * 10)
+            return int(self.watch_world.get()) == world
+        except (ValueError, TypeError):
+            return False
+
+    def make_world_alert(self, event, now, context, watched):
+        threshold = max(1, self.world_alert_threshold.get())
+        noise = self.delta_noise[event.world]
+        baseline = sum(noise) / len(noise) if noise else 0.0
+        scale = max(float(threshold), baseline * 2.5, 3.0)
+        score = 45 + (event.magnitude / scale) * 10
         if event.magnitude >= threshold * 2:
-            score += 5
-        return WorldMovement(event.world, event.amount, min(99, round(score)), now, watched)
+            score += 10
+        if event.magnitude >= threshold * 3:
+            score += 8
+        return WorldAlert(
+            world=event.world,
+            delta=event.amount,
+            score=min(99, max(0, round(score))),
+            timestamp=now,
+            context=context,
+            watched=watched,
+        )
 
     def raise_banner(self, text):
         self.alert_banner.set("ALERT • " + text)
@@ -873,48 +975,68 @@ class App:
         values = self.tree.item(selection[0], "values")
         if self.view == "teams":
             idx = int(selection[0][1:])
-            if idx < len(self.teams):
-                team = self.teams[idx]
-                route = " → ".join(map(str, team.route))
-                self.detail.set(f"TEAM • ~{team.size} players • {likelihood_label(team.score)} • last seen {int(team.age)}s ago • {route}")
+            visible = [team for team in self.teams if team.score >= self.min_conf.get()]
+            if idx < len(visible):
+                team = visible[idx]
+                seed = ""
+                if team.seed_sources:
+                    seed = f" • convergence sources {', '.join(map(str, team.seed_sources))}"
+                self.detail.set(
+                    f"TEAM • ~{team.size} players • {likelihood_label(team.score)} • last seen {int(team.age)}s ago • route {' → '.join(map(str, team.route))}{seed}"
+                )
         elif self.view == "hops":
-            self.detail.set(f"World {values[0]} → {values[1]} • {values[2]} left • {values[3]} appeared • estimated group {values[4]} • {values[5]}")
+            self.detail.set(
+                f"World {values[0]} → {values[1]} • {values[2]} left • {values[3]} appeared • estimated group {values[4]} • {values[5]}"
+            )
         elif self.view == "convergences":
-            self.detail.set(f"{values[0]} → World {values[1]} • destination gain {values[2]} • source outflow {values[3]} • {values[4]}")
+            self.detail.set(
+                f"{values[0]} → World {values[1]} • destination gain {values[2]} • total source outflow {values[3]} • {values[4]}"
+            )
         elif self.view == "worlds":
             self.detail.set(f"World {values[0]} • {values[1]} players • {values[2]} • {values[3]} • {values[4]}")
-        else:
-            self.detail.set(f"World {values[0]} • {values[1]} {abs(int(values[2]))} players • {values[3]}")
+        elif self.view == "alerts":
+            self.detail.set(
+                f"World {values[0]} • {values[1].lower()} {abs(int(values[2]))} players • {values[3]} • {values[4]}"
+            )
 
     def redraw(self):
         self.tree.delete(*self.tree.get_children())
         min_conf = self.min_conf.get()
+
         if self.view == "teams":
             self.teams = [team for team in self.teams if team.is_alive()]
-            for index, team in enumerate(self.teams):
+            visible = []
+            for team in self.teams:
                 if team.score < min_conf:
                     continue
-                route = " → ".join(map(str, team.route))
-                values = (
-                    "ACTIVE",
-                    route,
-                    f"~{team.size}",
-                    team.hop_count,
-                    likelihood_label(team.score),
-                    f"{int(team.age)}s",
+                visible.append(team)
+                self.tree.insert(
+                    "", "end", iid=f"t{len(visible) - 1}",
+                    values=("ACTIVE", " → ".join(map(str, team.route)), f"~{team.size}", team.hop_count, likelihood_label(team.score), f"{int(team.age)}s"),
+                    tags=(likelihood_tag(team.score),),
                 )
-                self.tree.insert("", "end", iid=f"t{index}", values=values, tags=(likelihood_tag(team.score),))
         elif self.view == "hops":
             for hop in self.hops:
                 if hop.score < min_conf:
                     continue
-                self.tree.insert("", "end", values=(hop.source, hop.destination, hop.left, hop.appeared, hop.moved, likelihood_label(hop.score), time.strftime("%H:%M:%S", time.localtime(hop.timestamp))), tags=(likelihood_tag(hop.score),))
+                self.tree.insert(
+                    "", "end",
+                    values=(hop.source, hop.destination, hop.left, hop.appeared, hop.moved, likelihood_label(hop.score), time.strftime("%H:%M:%S", time.localtime(hop.timestamp))),
+                    tags=(likelihood_tag(hop.score),),
+                )
         elif self.view == "convergences":
             for convergence in self.convergences:
                 if convergence.score < min_conf:
                     continue
-                sources = " + ".join(f"{world} (-{amount})" for world, amount in zip(convergence.sources, convergence.source_amounts))
-                self.tree.insert("", "end", values=(sources, convergence.destination, f"+{convergence.appeared}", f"~{convergence.total_outflow}", likelihood_label(convergence.score), time.strftime("%H:%M:%S", time.localtime(convergence.timestamp))), tags=(likelihood_tag(convergence.score),))
+                sources = " + ".join(
+                    f"{world} (-{amount})"
+                    for world, amount in zip(convergence.sources, convergence.source_amounts)
+                )
+                self.tree.insert(
+                    "", "end",
+                    values=(sources, convergence.destination, f"+{convergence.appeared}", f"~{convergence.total_outflow}", likelihood_label(convergence.score), time.strftime("%H:%M:%S", time.localtime(convergence.timestamp))),
+                    tags=(likelihood_tag(convergence.score),),
+                )
         elif self.view == "worlds":
             try:
                 watched = int(self.watch_world.get()) if self.watch_enabled.get() else None
@@ -922,29 +1044,38 @@ class App:
                 watched = None
             for world in self.visible_worlds():
                 tags = ("watch",) if world.world == watched else ()
-                self.tree.insert("", "end", values=(world.world, f"{world.players:,}", world.membership, world.location, world.activity), tags=tags)
+                self.tree.insert(
+                    "", "end",
+                    values=(world.world, f"{world.players:,}", world.membership, world.location, world.activity),
+                    tags=tags,
+                )
         else:
-            for movement in self.alerts:
-                if movement.score < min_conf and not movement.watched:
-                    continue
-                direction = "INFLUX" if movement.delta > 0 else "OUTFLOW"
-                tags = [likelihood_tag(movement.score)]
-                if movement.watched:
+            # Alerts intentionally do not use min_conf as a visibility filter.
+            # The alert threshold means “show movements >= X”, while confidence
+            # is explanatory rather than a gate. This fixes the old cross-view mismatch.
+            for alert in self.alerts:
+                direction = "INFLUX" if alert.delta > 0 else "OUTFLOW"
+                tags = [likelihood_tag(alert.score)]
+                if alert.watched:
                     tags.append("watch")
-                self.tree.insert("", "end", values=(movement.world, direction, f"{movement.delta:+d}", likelihood_label(movement.score), time.strftime("%H:%M:%S", time.localtime(movement.timestamp))), tags=tuple(tags))
+                self.tree.insert(
+                    "", "end",
+                    values=(alert.world, direction, f"{alert.delta:+d}", alert.context, likelihood_label(alert.score), time.strftime("%H:%M:%S", time.localtime(alert.timestamp))),
+                    tags=tuple(tags),
+                )
 
     def clear_history(self):
+        self.previous = None
+        self.movement_episodes.clear()
+        self.recent_events.clear()
+        self.movement_history.clear()
         self.hops.clear()
         self.convergences.clear()
         self.teams.clear()
         self.alerts.clear()
-        self.recent_events.clear()
-        self.movement_history.clear()
-        self.movement_episodes.clear()
         self.delta_noise.clear()
-        self.last_hop_reported.clear()
-        self.last_convergence_reported.clear()
-        self.previous = None
+        self.reported_hops.clear()
+        self.reported_convergences.clear()
         self.alert_banner.set("No alerts yet")
         self.detail.set("History cleared. Waiting for the next snapshot.")
         self.redraw()
@@ -956,7 +1087,9 @@ class App:
 def log_startup_error(exc):
     try:
         with STARTUP_LOG.open("a", encoding="utf-8") as stream:
-            stream.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {type(exc).__name__}: {exc}\n")
+            stream.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {type(exc).__name__}: {exc}\n"
+            )
     except Exception:
         pass
 
@@ -985,6 +1118,7 @@ class PasswordWindow(tk.Tk):
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=APP_NAME, style="LoginTitle.TLabel").pack(anchor="w")
         ttk.Label(frame, text="Enter password to open the tracker", style="LoginText.TLabel").pack(anchor="w", pady=(7, 12))
+
         self.password = tk.StringVar()
         self.entry = ttk.Entry(frame, textvariable=self.password, show="*")
         self.entry.pack(fill="x")
@@ -998,6 +1132,7 @@ class PasswordWindow(tk.Tk):
 
         self.error = tk.StringVar()
         ttk.Label(frame, textvariable=self.error, style="LoginError.TLabel").pack(anchor="w", pady=(6, 0))
+
         row = ttk.Frame(frame, style="Login.TFrame")
         row.pack(fill="x", pady=(12, 0))
         ttk.Button(row, text="Exit", command=self.cancel, width=12, style="Login.TButton").pack(side="right", padx=(8, 0))
@@ -1066,7 +1201,10 @@ def run_app():
             from tkinter import messagebox
             root = tk.Tk()
             root.withdraw()
-            messagebox.showerror(APP_NAME, f"The program could not start.\n\n{type(exc).__name__}: {exc}\n\nLog: {STARTUP_LOG}")
+            messagebox.showerror(
+                APP_NAME,
+                f"The program could not start.\n\n{type(exc).__name__}: {exc}\n\nLog: {STARTUP_LOG}",
+            )
             root.destroy()
         except Exception:
             pass
