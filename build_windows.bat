@@ -1,55 +1,35 @@
-@echo off
-setlocal
-cd /d "%~dp0"
+name: Build Windows Executable
 
-echo ===============================================
-echo   Cake Powder / Faithful Few
-echo   OSRS World Tracker - Windows Build
-echo ===============================================
-echo.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
-where py >nul 2>nul
-if %errorlevel%==0 goto PYFOUND
-where python >nul 2>nul
-if %errorlevel%==0 goto PYFOUND
+jobs:
+  build:
+    runs-on: windows-latest
 
-echo Python was not found.
-echo.
-echo You do NOT need Python to run the finished EXE.
-echo This script is only for building the EXE locally.
-echo.
-echo Easiest option: use the GitHub Actions build described in README.md.
-echo.
-pause
-exit /b 1
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-:PYFOUND
-py -3 -m pip install --upgrade pyinstaller
-if errorlevel 1 goto FAIL
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
 
-if exist build rmdir /s /q build
-if exist dist rmdir /s /q dist
-if exist "Cake Powder OSRS World Tracker.spec" del /q "Cake Powder OSRS World Tracker.spec"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller beautifulsoup4 requests
 
-py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "Cake Powder OSRS World Tracker" world_tracker.py
-if errorlevel 1 goto FAIL
+    - name: Build Executable with PyInstaller
+      run: |
+        pyinstaller --noconfirm --clean --onefile --windowed --name "Cake's OSRS World Tracker" world_tracker.py
 
-echo.
-echo ===============================================
-echo BUILD COMPLETE
-echo ===============================================
-echo.
-echo Your standalone application is:
-echo dist\Cake Powder OSRS World Tracker.exe
-echo.
-echo Copy that EXE anywhere you like. Python is NOT required to run it.
-echo.
-pause
-exit /b 0
-
-:FAIL
-echo.
-echo BUILD FAILED.
-echo Check the error above.
-pause
-exit /b 1
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Cakes-OSRS-World-Tracker-Windows
+        path: dist/Cake's OSRS World Tracker.exe
