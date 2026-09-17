@@ -1,1214 +1,509 @@
-import html
+"""
+Cake's OSRS World Tracker
+-------------------------
+A Windows/Python desktop application designed to detect, infer, and track
+PK teams moving across Old School RuneScape (OSRS) worlds via population telemetry.
+"""
+
+import time
 import re
 import threading
-import time
-import urllib.request
-from collections import defaultdict, deque
-from dataclasses import dataclass
-from html.parser import HTMLParser
-from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox, font
+import urllib.request
+from bs4 import BeautifulSoup
 
-try:
-    import winsound
-except ImportError:
-    winsound = None
-
-SOURCE_URL = "https://oldschool.runescape.com/slu"
-POLL_INTERVAL = 2
-NORMAL_MATCH_WINDOW = 10
-CONVERGENCE_WINDOW = 30
-TEAM_HISTORY_SECONDS = 60 * 60
+# Global Configuration & Defaults
+DEFAULT_PASSWORD = "1234"
+DISCORD_CONTACT = "_____cooper_____"
+POLL_INTERVAL_SEC = 2.0
+NORMAL_HOP_WINDOW_SEC = 10.0
+CONVERGENCE_WINDOW_SEC = 30.0
+TEAM_EXPIRY_SEC = 3600.0  # 1 hour
+MIN_MOVEMENT_THRESHOLD = 10
 MAX_TRACKED_MOVEMENT = 400
-EPISODE_MAX_SECONDS = 10
-EPISODE_QUIET_SECONDS = 4
-MAX_HISTORY_EVENTS = 500
-APP_NAME = "Cake's OSRS World Tracker"
-APP_PASSWORD = "1234"
-STARTUP_LOG = Path.home() / "cakes_osrs_tracker_startup.log"
 
 
-@dataclass(frozen=True)
-class World:
-    world: int
-    players: int
-    location: str
-    membership: str
-    activity: str
+class WorldSnapshot:
+    """Represents a parsed snapshot of an OSRS world."""
+    def __init__(self, world_id, players, location, activity, is_members):
+        self.world_id = int(world_id)
+        self.players = int(players)
+        self.location = str(location)
+        self.activity = str(activity)
+        self.is_members = bool(is_members)
+        self.timestamp = time.time()
 
 
-@dataclass(frozen=True)
-class Change:
-    world: int
-    amount: int
-    start_time: float
-    end_time: float
+class MovementEvent:
+    """Canonical movement event emitted when a qualifying population change occurs."""
+    def __init__(self, world_id, delta, start_pop, end_pop, start_time, end_time):
+        self.event_id = f"{world_id}_{int(start_time)}_{delta}"
+        self.world_id = world_id
+        self.delta = delta  # Negative = outflow, Positive = inflow
+        self.start_pop = start_pop
+        self.end_pop = end_pop
+        self.start_time = start_time
+        self.end_time = end_time
 
     @property
     def magnitude(self):
-        return abs(self.amount)
+        return abs(self.delta)
 
     @property
-    def direction(self):
-        return 1 if self.amount > 0 else -1
+    def is_outflow(self):
+        return self.delta < 0
 
     @property
-    def key(self):
-        return (
-            self.world,
-            self.amount,
-            round(self.start_time, 1),
-            round(self.end_time, 1),
-        )
+    def is_inflow(self):
+        return self.delta > 0
 
 
-@dataclass(frozen=True)
-class Hop:
-    source: int
-    destination: int
-    left: int
-    appeared: int
-    moved: int
-    score: int
-    timestamp: float
-    source_event: tuple
-    destination_event: tuple
-
-    @property
-    def key(self):
-        return (self.source, self.destination, self.source_event, self.destination_event)
-
-
-@dataclass(frozen=True)
-class Convergence:
-    destination: int
-    sources: tuple
-    source_amounts: tuple
-    appeared: int
-    score: int
-    timestamp: float
-    destination_event: tuple
-    source_events: tuple
-
-    @property
-    def source_count(self):
-        return len(self.sources)
-
-    @property
-    def total_outflow(self):
-        return sum(self.source_amounts)
-
-    @property
-    def key(self):
-        return (self.destination, tuple(sorted(self.sources)), self.destination_event)
-
-
-@dataclass(frozen=True)
-class WorldAlert:
-    world: int
-    delta: int
-    score: int
-    timestamp: float
-    context: str
-    watched: bool = False
-
-
-class WorldParser(HTMLParser):
-    """Parse official world data and use id='slu-world-XXX' for the real ID."""
-
-    def __init__(self):
-        super().__init__()
-        self.in_row = False
-        self.in_cell = False
-        self.cell_buf = []
-        self.row = []
-        self.world_id = None
-        self.rows = []
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        attrs = dict(attrs)
-        if tag == "tr":
-            self.in_row = True
-            self.in_cell = False
-            self.cell_buf = []
-            self.row = []
-            self.world_id = None
-        elif self.in_row and tag in ("td", "th"):
-            self.in_cell = True
-            self.cell_buf = []
-        elif self.in_row and tag == "a":
-            match = re.fullmatch(r"slu-world-(\d+)", attrs.get("id", ""))
-            if match:
-                self.world_id = int(match.group(1))
-
-    def handle_data(self, data):
-        if self.in_cell:
-            self.cell_buf.append(data)
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag in ("td", "th") and self.in_cell:
-            text = re.sub(r"\s+", " ", html.unescape("".join(self.cell_buf))).strip()
-            self.row.append(text)
-            self.in_cell = False
-        elif tag == "tr" and self.in_row:
-            if self.world_id is not None and self.row:
-                self.rows.append((self.world_id, self.row))
-            self.in_row = False
-            self.in_cell = False
-            self.cell_buf = []
-            self.row = []
-            self.world_id = None
-
-
-def fetch_worlds():
-    request = urllib.request.Request(
-        SOURCE_URL,
-        headers={"User-Agent": "Cakes-OSRS-World-Tracker/8.0"},
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        raw = response.read().decode("utf-8", "replace")
-
-    parser = WorldParser()
-    parser.feed(raw)
-    worlds = []
-    for world_id, row in parser.rows:
-        if len(row) < 5:
-            continue
-        match = re.search(r"([\d,]+)\s+players?", row[1], re.I)
-        if not match:
-            continue
-        membership = row[3].strip()
-        if membership not in ("Members", "Free"):
-            continue
-        worlds.append(
-            World(
-                world=world_id,
-                players=int(match.group(1).replace(",", "")),
-                location=row[2].strip(),
-                membership=membership,
-                activity=row[4].strip() or "-",
-            )
-        )
-
-    unique = {world.world: world for world in worlds}
-    if not unique:
-        raise RuntimeError("No OSRS worlds found in the server list.")
-    return sorted(unique.values(), key=lambda world: world.world)
-
-
-def ratio_score(left, appeared):
-    if left <= 0 or appeared <= 0:
-        return 0.0
-    return min(left, appeared) / max(left, appeared)
-
-
-def likelihood_label(score):
-    if score >= 90:
-        return "VERY LIKELY"
-    if score >= 75:
-        return "LIKELY"
-    if score >= 50:
-        return "POSSIBLE"
-    return "UNLIKELY"
-
-
-def likelihood_tag(score):
-    if score >= 90:
-        return "very"
-    if score >= 75:
-        return "likely"
-    if score >= 50:
-        return "possible"
-    return "unlikely"
-
-
-def _new_episode(previous_population, step, now):
-    return {
-        "direction": 1 if step > 0 else -1,
-        "anchor": previous_population,
-        "start_time": now,
-        "last_nonzero": now,
-        "triggered": False,
-    }
-
-
-def build_movement_episodes(episodes, previous, current, now, min_group):
-    """Build one short movement episode at a time, instead of one event per poll.
-
-    An episode may accumulate over up to 10 seconds. Once the population is quiet
-    for four seconds, a new episode may begin even in the same direction. This
-    avoids both repeated alerts and permanently merging separate team movements.
+class MovementEpisodeTracker:
     """
-    emitted = []
-    min_group = max(1, min(MAX_TRACKED_MOVEMENT, int(min_group)))
+    Groups sequential 2-second deltas into continuous movement episodes to avoid delta spam.
+    Example: 1000 -> 994 -> 979 -> 970 becomes a single outflow episode.
+    """
+    def __init__(self, min_threshold=10, max_cap=400, quiet_reset_sec=6.0):
+        self.min_threshold = min_threshold
+        self.max_cap = max_cap
+        self.quiet_reset_sec = quiet_reset_sec
+        self.active_episodes = {}  # world_id -> dict state
+        self.last_seen_pop = {}    # world_id -> int
 
-    for world in set(previous) & set(current):
-        prev_population = previous[world].players
-        current_population = current[world].players
-        step = current_population - prev_population
-        state = episodes.get(world)
+    def process_snapshot(self, snapshot):
+        w_id = snapshot.world_id
+        curr_pop = snapshot.players
+        now = snapshot.timestamp
+        emitted_events = []
 
-        if state is not None and now - state["start_time"] > EPISODE_MAX_SECONDS:
-            state = None
-            episodes.pop(world, None)
+        if w_id not in self.last_seen_pop:
+            self.last_seen_pop[w_id] = curr_pop
+            return emitted_events
 
-        if step == 0:
-            if state is not None and now - state["last_nonzero"] >= EPISODE_QUIET_SECONDS:
-                episodes.pop(world, None)
-            continue
+        prev_pop = self.last_seen_pop[w_id]
+        delta = curr_pop - prev_pop
 
-        if state is None:
-            state = _new_episode(prev_population, step, now)
-            episodes[world] = state
-        elif step * state["direction"] < 0:
-            state = _new_episode(prev_population, step, now)
-            episodes[world] = state
+        # If population hasn't changed, check if active episode needs finalizing
+        if delta == 0:
+            if w_id in self.active_episodes:
+                ep = self.active_episodes[w_id]
+                if now - ep['last_update'] >= self.quiet_reset_sec:
+                    event = self._finalize_episode(w_id)
+                    if event:
+                        emitted_events.append(event)
+            self.last_seen_pop[w_id] = curr_pop
+            return emitted_events
+
+        # Reject massive multi-hundred swings (world resets / sorting errors)
+        if abs(delta) > self.max_cap:
+            self.last_seen_pop[w_id] = curr_pop
+            return emitted_events
+
+        if w_id not in self.active_episodes:
+            # Start new episode
+            self.active_episodes[w_id] = {
+                'start_pop': prev_pop,
+                'end_pop': curr_pop,
+                'accumulated_delta': delta,
+                'start_time': now,
+                'last_update': now,
+                'direction': 1 if delta > 0 else -1
+            }
         else:
-            state["last_nonzero"] = now
+            ep = self.active_episodes[w_id]
+            curr_dir = 1 if delta > 0 else -1
 
-        net = current_population - state["anchor"]
-        if abs(net) > MAX_TRACKED_MOVEMENT:
-            episodes.pop(world, None)
-            continue
+            # Direction reversal triggers episode finalization
+            if curr_dir != ep['direction']:
+                event = self._finalize_episode(w_id)
+                if event:
+                    emitted_events.append(event)
+                # Re-initiate new episode direction
+                self.active_episodes[w_id] = {
+                    'start_pop': prev_pop,
+                    'end_pop': curr_pop,
+                    'accumulated_delta': delta,
+                    'start_time': now,
+                    'last_update': now,
+                    'direction': curr_dir
+                }
+            else:
+                # Continue accumulating in same direction
+                ep['end_pop'] = curr_pop
+                ep['accumulated_delta'] += delta
+                ep['last_update'] = now
 
-        if not state["triggered"] and abs(net) >= min_group:
-            state["triggered"] = True
-            emitted.append(
-                Change(
-                    world=world,
-                    amount=net,
-                    start_time=state["start_time"],
-                    end_time=now,
-                )
+                # If single accumulation jump is large enough, emit early to maintain responsiveness
+                if abs(ep['accumulated_delta']) >= self.min_threshold:
+                    event = self._finalize_episode(w_id)
+                    if event:
+                        emitted_events.append(event)
+
+        self.last_seen_pop[w_id] = curr_pop
+        return emitted_events
+
+    def _finalize_episode(self, w_id):
+        if w_id not in self.active_episodes:
+            return None
+
+        ep = self.active_episodes.pop(w_id)
+        tot_delta = ep['accumulated_delta']
+
+        if abs(tot_delta) >= self.min_threshold and abs(tot_delta) <= self.max_cap:
+            return MovementEvent(
+                world_id=w_id,
+                delta=tot_delta,
+                start_pop=ep['start_pop'],
+                end_pop=ep['end_pop'],
+                start_time=ep['start_time'],
+                end_time=ep['last_update']
             )
-
-    return emitted
-
-
-def score_hop(source, destination):
-    age = abs(source.end_time - destination.end_time)
-    if age > NORMAL_MATCH_WINDOW:
-        return 0
-
-    ratio = ratio_score(source.magnitude, destination.magnitude)
-    timing = 1.0 - age / NORMAL_MATCH_WINDOW
-    size = max(source.magnitude, destination.magnitude)
-
-    score = 46 * ratio + 34 * timing + min(20, size / 25 * 20)
-    if ratio < 0.50:
-        score -= 22
-    elif ratio < 0.65:
-        score -= 12
-    elif ratio < 0.80:
-        score -= 5
-    if size <= 6:
-        score -= 4
-    return min(99, max(0, round(score)))
-
-
-def match_movement_events(events, now, min_group):
-    """Globally match unique drop/gain events inside the rolling 10-second window."""
-    cutoff = now - NORMAL_MATCH_WINDOW
-    min_group = max(1, min(MAX_TRACKED_MOVEMENT, int(min_group)))
-    drops = [e for e in events if e.end_time >= cutoff and e.amount <= -min_group]
-    gains = [e for e in events if e.end_time >= cutoff and e.amount >= min_group]
-
-    candidates = []
-    for source in drops:
-        for destination in gains:
-            if source.world == destination.world:
-                continue
-            score = score_hop(source, destination)
-            if score >= 45:
-                candidates.append((score, source, destination))
-
-    candidates.sort(
-        key=lambda item: (
-            item[0],
-            min(item[1].magnitude, item[2].magnitude),
-            -abs(item[1].end_time - item[2].end_time),
-        ),
-        reverse=True,
-    )
-
-    used_sources = set()
-    used_destinations = set()
-    results = []
-    for score, source, destination in candidates:
-        if source.key in used_sources or destination.key in used_destinations:
-            continue
-        results.append(
-            Hop(
-                source=source.world,
-                destination=destination.world,
-                left=source.magnitude,
-                appeared=destination.magnitude,
-                moved=max(source.magnitude, destination.magnitude),
-                score=score,
-                timestamp=max(source.end_time, destination.end_time),
-                source_event=source.key,
-                destination_event=destination.key,
-            )
-        )
-        used_sources.add(source.key)
-        used_destinations.add(destination.key)
-    return results
-
-
-def detect_convergences(events, now, min_group):
-    """Detect 2+ source worlds feeding one destination inside 30 seconds."""
-    cutoff = now - CONVERGENCE_WINDOW
-    min_group = max(1, min(MAX_TRACKED_MOVEMENT, int(min_group)))
-    recent = [e for e in events if e.end_time >= cutoff and e.magnitude <= MAX_TRACKED_MOVEMENT]
-    drops = [e for e in recent if e.amount <= -min_group]
-    gains = [e for e in recent if e.amount >= min_group]
-    results = []
-
-    for destination in gains:
-        candidates = []
-        for source in drops:
-            if source.world == destination.world:
-                continue
-            age = abs(source.end_time - destination.end_time)
-            if age > CONVERGENCE_WINDOW:
-                continue
-            ratio = ratio_score(source.magnitude, destination.magnitude)
-            timing = 1 - age / CONVERGENCE_WINDOW
-            quality = ratio * 0.60 + timing * 0.40
-            candidates.append((quality, source, ratio, timing))
-
-        best_by_world = {}
-        for candidate in candidates:
-            quality, source, ratio, timing = candidate
-            old = best_by_world.get(source.world)
-            if old is None or quality > old[0]:
-                best_by_world[source.world] = candidate
-
-        chosen = sorted(
-            best_by_world.values(),
-            key=lambda item: (item[0], item[1].magnitude),
-            reverse=True,
-        )[:6]
-        if len(chosen) < 2:
-            continue
-
-        sizes = [item[1].magnitude for item in chosen]
-        median = sorted(sizes)[len(sizes) // 2]
-        consistency = 1 - sum(abs(size - median) for size in sizes) / max(1, sum(sizes))
-        avg_ratio = sum(item[2] for item in chosen) / len(chosen)
-        avg_timing = sum(item[3] for item in chosen) / len(chosen)
-        coverage = destination.magnitude / max(1, sum(sizes))
-
-        score = (
-            25
-            + 25 * avg_ratio
-            + 20 * avg_timing
-            + 12 * max(0.0, min(1.0, consistency))
-            + min(15, (len(chosen) - 1) * 7)
-            + min(7, coverage * 7)
-        )
-        if len(chosen) >= 3:
-            score += 6
-        return_score = min(99, max(0, round(score)))
-
-        results.append(
-            Convergence(
-                destination=destination.world,
-                sources=tuple(item[1].world for item in chosen),
-                source_amounts=tuple(item[1].magnitude for item in chosen),
-                appeared=destination.magnitude,
-                score=return_score,
-                timestamp=max([destination.end_time] + [item[1].end_time for item in chosen]),
-                destination_event=destination.key,
-                source_events=tuple(item[1].key for item in chosen),
-            )
-        )
-
-    best = {}
-    for result in results:
-        existing = best.get(result.destination)
-        if existing is None or result.score > existing.score:
-            best[result.destination] = result
-    return sorted(best.values(), key=lambda item: (item.score, item.source_count), reverse=True)
-
-
-class TeamTrack:
-    """Persistent inferred team state remembered for up to one hour."""
-
-    def __init__(self, *, first_hop=None, convergence=None):
-        self.route_worlds = []
-        self.hops = []
-        self.last_world = None
-        self.last_time = 0.0
-        self.approx_size = 0
-        self.seed_confidence = 0
-        self.seed_sources = ()
-
-        if first_hop is not None:
-            self.route_worlds = [first_hop.source, first_hop.destination]
-            self.hops = [first_hop]
-            self.last_world = first_hop.destination
-            self.last_time = first_hop.timestamp
-            self.approx_size = first_hop.moved
-        elif convergence is not None:
-            self.route_worlds = [convergence.destination]
-            self.last_world = convergence.destination
-            self.last_time = convergence.timestamp
-            self.approx_size = convergence.appeared
-            self.seed_confidence = convergence.score
-            self.seed_sources = convergence.sources
-
-    @property
-    def age(self):
-        return max(0.0, time.time() - self.last_time)
-
-    @property
-    def hop_count(self):
-        return len(self.hops)
-
-    @property
-    def route(self):
-        return list(self.route_worlds)
-
-    @property
-    def size(self):
-        if not self.hops:
-            return max(1, self.approx_size)
-        values = [hop.moved for hop in self.hops[-8:]]
-        if self.approx_size:
-            values.append(self.approx_size)
-        return max(1, round(sum(values) / len(values)))
-
-    @property
-    def score(self):
-        if not self.hops:
-            return min(99, max(50, self.seed_confidence))
-        scores = [hop.score for hop in self.hops[-8:]]
-        base = sum(scores) / len(scores)
-        values = [hop.moved for hop in self.hops[-8:]]
-        consistency = 1.0
-        if len(values) > 1:
-            mean = sum(values) / len(values)
-            deviation = sum(abs(value - mean) for value in values) / len(values)
-            consistency = max(0.0, 1.0 - deviation / max(1, mean))
-        repeat_bonus = min(28, max(0, len(self.hops) - 1) * 8)
-        seed_bonus = min(15, max(0, self.seed_confidence - 70) // 2) if self.seed_confidence else 0
-        return min(99, max(0, round(base * 0.70 + consistency * 14 + repeat_bonus + seed_bonus)))
-
-    def is_alive(self):
-        return self.last_time > 0 and time.time() - self.last_time <= TEAM_HISTORY_SECONDS
-
-    def can_extend(self, hop):
-        if not self.is_alive() or hop.source != self.last_world:
-            return False
-        expected = max(1, self.size)
-        ratio = hop.moved / expected
-        return 0.35 <= ratio <= 1.80
-
-    def add(self, hop):
-        self.hops.append(hop)
-        self.last_world = hop.destination
-        self.last_time = hop.timestamp
-        self.approx_size = hop.moved
-        if not self.route_worlds:
-            self.route_worlds = [hop.source]
-        if self.route_worlds[-1] != hop.destination:
-            self.route_worlds.append(hop.destination)
-
-    def reinforce(self, convergence):
-        if convergence.destination != self.last_world:
-            return False
-        self.approx_size = round((self.size + convergence.appeared) / 2)
-        self.seed_confidence = max(self.seed_confidence, convergence.score)
-        self.seed_sources = convergence.sources
-        self.last_time = max(self.last_time, convergence.timestamp)
-        return True
-
-
-class App:
-    def __init__(self, root):
-        self.root = root
-        root.title(APP_NAME)
-        root.geometry("1250x760")
-        root.minsize(1050, 650)
-        root.configure(bg="#0b1018")
-
-        style = ttk.Style(root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        self.configure_style(style)
-
-        self.worlds = []
-        self.previous = None
-        self.movement_episodes = {}
-        self.recent_events = deque(maxlen=MAX_HISTORY_EVENTS)
-        self.movement_history = deque(maxlen=MAX_HISTORY_EVENTS)
-        self.hops = deque(maxlen=250)
-        self.convergences = deque(maxlen=150)
-        self.teams = []
-        self.alerts = deque(maxlen=500)
-        self.delta_noise = defaultdict(lambda: deque(maxlen=24))
-        self.reported_hops = {}
-        self.reported_convergences = {}
-        self.fetch_in_progress = False
-        self.fetch_failures = 0
-        self.last_fetch_started = 0.0
-
-        self.f2p = tk.BooleanVar(value=False)
-        self.min_group = tk.IntVar(value=10)
-        self.min_conf = tk.IntVar(value=50)
-        self.world_alert_threshold = tk.IntVar(value=10)
-        self.watch_enabled = tk.BooleanVar(value=False)
-        self.watch_world = tk.StringVar(value="")
-        self.watch_threshold = tk.IntVar(value=10)
-        self.sound_alerts = tk.BooleanVar(value=False)
-
-        self.view = "teams"
-        self.status = tk.StringVar(value="Starting…")
-        self.detail = tk.StringVar(value="Waiting for the first world snapshot.")
-        self.alert_banner = tk.StringVar(value="No alerts yet")
-
-        self.build_ui()
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        root.after(100, self.refresh)
-
-    def configure_style(self, style):
-        style.configure("TFrame", background="#0b1018")
-        style.configure("TLabel", background="#0b1018", foreground="#e7edf6", font=("Segoe UI", 9))
-        style.configure("Header.TLabel", background="#0b1018", foreground="#f4f7fb", font=("Segoe UI", 22, "bold"))
-        style.configure("Status.TLabel", background="#0b1018", foreground="#8d9ab0", font=("Segoe UI", 9))
-        style.configure("Title.TLabel", background="#0b1018", foreground="#b477ff", font=("Segoe UI", 11, "bold"))
-        style.configure("TCheckbutton", background="#111927", foreground="#dce4f0", font=("Segoe UI", 9))
-        style.map("TCheckbutton", background=[("active", "#111927")])
-        style.configure("TLabelframe", background="#111927", foreground="#a970ff", bordercolor="#263247")
-        style.configure("TLabelframe.Label", background="#111927", foreground="#a970ff", font=("Segoe UI", 9, "bold"))
-        style.configure("TButton", background="#182235", foreground="#e7edf6", bordercolor="#2a3951", padding=(11, 6), font=("Segoe UI", 9, "bold"))
-        style.map("TButton", background=[("active", "#293953"), ("pressed", "#34476a")])
-        style.configure("Accent.TButton", background="#7c4dff", foreground="white", bordercolor="#7c4dff", padding=(13, 7), font=("Segoe UI", 9, "bold"))
-        style.map("Accent.TButton", background=[("active", "#966eff"), ("pressed", "#6938df")])
-        style.configure("Modern.Treeview", background="#111927", fieldbackground="#111927", foreground="#e7edf6", rowheight=31, borderwidth=0, relief="flat", font=("Segoe UI", 9))
-        style.configure("Modern.Treeview.Heading", background="#182235", foreground="#d5ddeb", relief="flat", borderwidth=0, padding=(8, 8), font=("Segoe UI", 9, "bold"))
-        style.map("Modern.Treeview", background=[("selected", "#3d2875")], foreground=[("selected", "white")])
-        style.configure("Modern.Vertical.TScrollbar", background="#182235", troughcolor="#0b1018", bordercolor="#0b1018", arrowcolor="#91a0b5")
-
-    def build_ui(self):
-        header = ttk.Frame(self.root, padding=(18, 14, 18, 7))
-        header.pack(fill="x")
-        ttk.Label(header, text=APP_NAME, style="Header.TLabel").pack(side="left")
-        ttk.Label(header, textvariable=self.status, style="Status.TLabel").pack(side="right")
-
-        controls = ttk.Frame(self.root, padding=(18, 0, 18, 9))
-        controls.pack(fill="x")
-        ttk.Label(controls, text="Group ≥").pack(side="left")
-        ttk.Spinbox(controls, from_=1, to=400, textvariable=self.min_group, width=5).pack(side="left", padx=(5, 12))
-        ttk.Label(controls, text="Show").pack(side="left")
-        self.conf_combo = ttk.Combobox(controls, values=("Possible", "Likely", "Very likely"), state="readonly", width=11)
-        self.conf_combo.current(0)
-        self.conf_combo.bind("<<ComboboxSelected>>", self.conf_changed)
-        self.conf_combo.pack(side="left", padx=(5, 12))
-        ttk.Checkbutton(controls, text="F2P", variable=self.f2p, command=self.reset_baseline).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(controls, text="Sound", variable=self.sound_alerts).pack(side="left")
-        ttk.Button(controls, text="Settings", command=self.open_settings).pack(side="right", padx=(7, 0))
-        ttk.Button(controls, text="Refresh", style="Accent.TButton", command=self.refresh).pack(side="right")
-
-        body = ttk.Frame(self.root, padding=(18, 0, 18, 14))
-        body.pack(fill="both", expand=True)
-
-        nav = ttk.Frame(body)
-        nav.pack(fill="x", pady=(0, 7))
-        for text, view in (
-            ("Active Teams", "teams"),
-            ("Mass Hops", "hops"),
-            ("Convergences", "convergences"),
-            ("Worlds", "worlds"),
-            ("World Alerts", "alerts"),
-        ):
-            ttk.Button(nav, text=text, command=lambda v=view: self.set_view(v)).pack(side="left", padx=(0, 5))
-        ttk.Label(nav, textvariable=self.alert_banner, foreground="#b477ff").pack(side="right")
-
-        self.view_title = ttk.Label(body, text="ACTIVE TEAMS", style="Title.TLabel")
-        self.view_title.pack(anchor="w", pady=(0, 6))
-
-        table_frame = ttk.Frame(body)
-        table_frame.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(table_frame, show="headings", style="Modern.Treeview")
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview, style="Modern.Vertical.TScrollbar")
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", self.select_row)
-        self.tree.tag_configure("very", foreground="#39e58c")
-        self.tree.tag_configure("likely", foreground="#e8d44d")
-        self.tree.tag_configure("possible", foreground="#ff9d32")
-        self.tree.tag_configure("unlikely", foreground="#ff5964")
-        self.tree.tag_configure("watch", background="#241a3d")
-
-        ttk.Label(body, textvariable=self.detail, wraplength=1120, foreground="#8d9ab0").pack(anchor="w", pady=(8, 0))
-        self.set_view("teams")
-
-    def open_settings(self):
-        win = tk.Toplevel(self.root)
-        win.title("Tracker Settings")
-        win.geometry("390x455")
-        win.resizable(False, False)
-        win.configure(bg="#0b1018")
-        win.transient(self.root)
-
-        frame = ttk.Frame(win, padding=18)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="TRACKER SETTINGS", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="Detection thresholds are independent so the views remain consistent.", foreground="#8d9ab0", wraplength=340).pack(anchor="w", pady=(4, 14))
-
-        ttk.Label(frame, text="Minimum group size").pack(anchor="w")
-        ttk.Spinbox(frame, from_=1, to=400, textvariable=self.min_group, width=8).pack(anchor="w", pady=(3, 12))
-
-        ttk.Label(frame, text="Minimum likelihood shown").pack(anchor="w")
-        combo = ttk.Combobox(frame, values=("Possible", "Likely", "Very likely"), state="readonly", width=14)
-        combo.set("Possible" if self.min_conf.get() == 50 else "Likely" if self.min_conf.get() == 75 else "Very likely")
-        combo.bind("<<ComboboxSelected>>", lambda _e: self.conf_changed_from(combo))
-        combo.pack(anchor="w", pady=(3, 12))
-
-        ttk.Label(frame, text="World Alerts threshold").pack(anchor="w")
-        ttk.Spinbox(frame, from_=1, to=400, textvariable=self.world_alert_threshold, width=8).pack(anchor="w", pady=(3, 12))
-        ttk.Label(frame, text="Any qualifying movement appears here, including movements that were successfully matched to a hop.", foreground="#8d9ab0", wraplength=340).pack(anchor="w", pady=(0, 12))
-
-        ttk.Checkbutton(frame, text="Watch a specific world", variable=self.watch_enabled, command=self.redraw).pack(anchor="w", pady=(2, 5))
-        ttk.Label(frame, text="World").pack(anchor="w")
-        self.settings_watch_combo = ttk.Combobox(frame, textvariable=self.watch_world, state="normal", width=12)
-        self.settings_watch_combo.pack(anchor="w", pady=(3, 5))
-        ttk.Label(frame, text="Watched-world threshold").pack(anchor="w")
-        ttk.Spinbox(frame, from_=1, to=400, textvariable=self.watch_threshold, width=8).pack(anchor="w", pady=(3, 15))
-
-        ttk.Button(frame, text="Clear history", command=lambda: (self.clear_history(), win.destroy())).pack(anchor="w", pady=(4, 8))
-        ttk.Button(frame, text="Close", command=win.destroy).pack(anchor="e")
-        self.update_watch_list()
-
-    def conf_changed_from(self, combo):
-        self.min_conf.set(50 if combo.get() == "Possible" else 75 if combo.get() == "Likely" else 90)
-        self.redraw()
-
-    def conf_changed(self, _event=None):
-        self.min_conf.set(50 if self.conf_combo.get() == "Possible" else 75 if self.conf_combo.get() == "Likely" else 90)
-        self.redraw()
-
-    def visible_worlds(self):
-        if self.f2p.get():
-            return list(self.worlds)
-        return [world for world in self.worlds if world.membership == "Members"]
-
-    def update_watch_list(self):
-        if not hasattr(self, "settings_watch_combo"):
-            return
-        self.settings_watch_combo["values"] = [str(world.world) for world in self.visible_worlds()]
-
-    def reset_baseline(self):
-        self.previous = None
-        self.movement_episodes.clear()
-        self.recent_events.clear()
-        self.movement_history.clear()
-        self.reported_hops.clear()
-        self.reported_convergences.clear()
-        self.detail.set("Baseline reset. Waiting for the next snapshot.")
-        self.redraw()
-
-    def set_view(self, view):
-        self.view = view
-        titles = {
-            "teams": "ACTIVE TEAMS",
-            "hops": "MASS HOPS",
-            "convergences": "CONVERGENCES",
-            "worlds": "WORLD POPULATIONS",
-            "alerts": "WORLD ALERTS",
-        }
-        columns = {
-            "teams": ("status", "route", "group", "hops", "confidence", "last"),
-            "hops": ("from", "to", "left", "appeared", "group", "confidence", "time"),
-            "convergences": ("sources", "to", "appeared", "outflow", "confidence", "time"),
-            "worlds": ("world", "players", "type", "location", "activity"),
-            "alerts": ("world", "direction", "change", "context", "confidence", "time"),
-        }
-        names = {
-            "status": "STATUS", "route": "ROUTE", "group": "GROUP", "hops": "HOPS", "confidence": "CONFIDENCE", "last": "LAST",
-            "from": "FROM", "to": "TO", "left": "LEFT", "appeared": "APPEARED", "time": "TIME",
-            "sources": "SOURCE WORLDS", "outflow": "SOURCE OUTFLOW", "world": "WORLD", "players": "PLAYERS", "type": "TYPE", "location": "LOCATION", "activity": "ACTIVITY",
-            "direction": "DIRECTION", "change": "CHANGE", "context": "CONTEXT",
-        }
-        self.view_title.config(text=titles[view])
-        self.tree["columns"] = columns[view]
-        for col in columns[view]:
-            self.tree.heading(col, text=names[col])
-            self.tree.column(col, width=120, anchor="center")
-
-        widths = {
-            "teams": (("status", 80), ("route", 480), ("group", 90), ("hops", 70), ("confidence", 125), ("last", 90)),
-            "hops": (("from", 75), ("to", 75), ("left", 90), ("appeared", 100), ("group", 100), ("confidence", 125), ("time", 90)),
-            "convergences": (("sources", 390), ("to", 75), ("appeared", 105), ("outflow", 130), ("confidence", 125), ("time", 90)),
-            "worlds": (("world", 80), ("players", 100), ("type", 90), ("location", 170), ("activity", 450)),
-            "alerts": (("world", 75), ("direction", 95), ("change", 85), ("context", 290), ("confidence", 125), ("time", 90)),
-        }
-        for col, width in widths[view]:
-            self.tree.column(col, width=width)
-
-        explanations = {
-            "teams": "Persistent inferred teams. A team can return to a previous world and is remembered for one hour after its latest evidence.",
-            "hops": "Matched population movements. Source and destination events are drawn from the same underlying movement records used by World Alerts.",
-            "convergences": "Two or more source worlds lose group-sized populations around the same time while one destination gains players.",
-            "worlds": "Current official OSRS world population snapshot.",
-            "alerts": "Every qualifying world movement appears here, whether or not it was matched to a hop or convergence.",
-        }
-        self.detail.set(explanations[view])
-        self.redraw()
-
-    def refresh(self):
-        if self.fetch_in_progress:
-            return
-        self.fetch_in_progress = True
-        self.last_fetch_started = time.time()
-        threading.Thread(target=self.worker, daemon=True).start()
-
-    def worker(self):
-        try:
-            worlds = fetch_worlds()
-            self.root.after(0, lambda worlds=worlds: self.apply_worlds(worlds))
-        except Exception as exc:
-            message = str(exc) or exc.__class__.__name__
-            self.root.after(0, lambda message=message: self.fetch_failed(message))
-
-    def fetch_failed(self, message):
-        self.fetch_in_progress = False
-        self.fetch_failures = min(5, self.fetch_failures + 1)
-        self.status.set("Update failed; retrying…")
-        self.detail.set(f"Could not update world data: {message}")
-        self.root.after(int(min(20, 2 ** self.fetch_failures) * 1000), self.refresh)
-
-    def apply_worlds(self, worlds):
-        self.fetch_in_progress = False
-        self.fetch_failures = 0
-        self.worlds = worlds
-        current = {world.world: world for world in self.visible_worlds()}
+        return None
+
+
+class InferredTeam:
+    """Represents a persistent inferred group/team tracked across OSRS worlds."""
+    def __init__(self, team_id, initial_world, initial_size, confidence="LIKELY"):
+        self.team_id = team_id
+        self.last_known_world = initial_world
+        self.approx_size = initial_size
+        self.confidence = confidence
+        self.route = [initial_world]
+        self.hop_count = 0
+        self.last_activity = time.time()
+        self.convergences_linked = 0
+
+    def record_hop(self, to_world, observed_size, hop_confidence):
+        self.route.append(to_world)
+        self.last_known_world = to_world
+        # Running average size estimation
+        self.approx_size = int((self.approx_size * 0.6) + (observed_size * 0.4))
+        self.hop_count += 1
+        self.last_activity = time.time()
+
+        # Repeated compatible movement upgrades overall team confidence
+        if self.hop_count >= 3 and self.confidence in ["POSSIBLE", "LIKELY"]:
+            self.confidence = "VERY LIKELY"
+        elif self.hop_count >= 1 and self.confidence == "POSSIBLE":
+            self.confidence = "LIKELY"
+
+    def record_convergence(self, target_world, size, confidence):
+        if self.last_known_world != target_world:
+            self.route.append(target_world)
+            self.last_known_world = target_world
+        self.approx_size = int((self.approx_size * 0.5) + (size * 0.5))
+        self.convergences_linked += 1
+        self.last_activity = time.time()
+        self.confidence = "VERY LIKELY"
+
+    def is_expired(self, current_time, expiry_sec=3600.0):
+        return (current_time - self.last_activity) > expiry_sec
+
+
+class HopMatcher:
+    """Matches outflow movement events with destination inflow events within a timing window."""
+    def __init__(self, window_sec=10.0):
+        self.window_sec = window_sec
+
+    def match(self, outflows, inflows):
+        matches = []
+        for out in outflows:
+            for inf in inflows:
+                if out.world_id == inf.world_id:
+                    continue
+
+                time_diff = abs(inf.start_time - out.start_time)
+                if time_diff <= self.window_sec:
+                    # Assess size compatibility
+                    ratio = min(out.magnitude, inf.magnitude) / max(out.magnitude, inf.magnitude)
+                    if ratio >= 0.35:  # Tolerate partial observations
+                        confidence = "VERY LIKELY" if ratio >= 0.75 else ("LIKELY" if ratio >= 0.5 else "POSSIBLE")
+                        matches.append({
+                            'source_world': out.world_id,
+                            'dest_world': inf.world_id,
+                            'outflow_size': out.magnitude,
+                            'inflow_size': inf.magnitude,
+                            'confidence': confidence,
+                            'timestamp': max(out.end_time, inf.end_time)
+                        })
+        return matches
+
+
+class ConvergenceDetector:
+    """Detects multi-world convergence patterns (≥2 distinct sources outflowing into 1 destination)."""
+    def __init__(self, window_sec=30.0):
+        self.window_sec = window_sec
+
+    def detect(self, outflows, inflows):
+        convergences = []
         now = time.time()
 
-        self.min_group.set(max(1, min(MAX_TRACKED_MOVEMENT, self.min_group.get())))
-        self.world_alert_threshold.set(max(1, min(MAX_TRACKED_MOVEMENT, self.world_alert_threshold.get())))
-        self.watch_threshold.set(max(1, min(MAX_TRACKED_MOVEMENT, self.watch_threshold.get())))
+        recent_outflows = [o for o in outflows if (now - o.start_time) <= self.window_sec]
+        recent_inflows = [i for i in inflows if (now - i.start_time) <= self.window_sec]
 
-        if self.previous is None:
-            self.previous = current
-            self.update_watch_list()
-            self.status.set(f"Baseline captured • {len(current)} worlds")
-        else:
-            min_group = self.min_group.get()
-            new_events = build_movement_episodes(self.movement_episodes, self.previous, current, now, min_group)
-            for event in new_events:
-                self.recent_events.append(event)
-                self.movement_history.append(event)
+        for inf in recent_inflows:
+            matching_sources = []
+            for out in recent_outflows:
+                if out.world_id != inf.world_id:
+                    matching_sources.append(out)
 
-            self.recent_events = self.prune_events(self.recent_events, now, NORMAL_MATCH_WINDOW)
-            self.movement_history = self.prune_events(self.movement_history, now, CONVERGENCE_WINDOW)
+            if len(matching_sources) >= 2:
+                total_outflow = sum(s.magnitude for s in matching_sources)
+                dest_inflow = inf.magnitude
+                confidence = "VERY LIKELY" if len(matching_sources) >= 3 else "LIKELY"
 
-            hops = match_movement_events(self.recent_events, now, min_group)
-            hops = [hop for hop in hops if not self.hop_recently_reported(hop, now)]
-            convergences = detect_convergences(self.movement_history, now, min_group)
-            convergences = [item for item in convergences if not self.convergence_recently_reported(item, now)]
+                convergences.append({
+                    'dest_world': inf.world_id,
+                    'dest_inflow': dest_inflow,
+                    'sources': [(s.world_id, s.magnitude) for s in matching_sources],
+                    'total_outflow': total_outflow,
+                    'confidence': confidence,
+                    'timestamp': inf.end_time
+                })
+        return convergences
 
-            matched_event_keys = set()
-            convergence_event_keys = set()
-            hop_event_keys = set()
 
-            for hop in hops:
-                hop_event_keys.add(hop.source_event)
-                hop_event_keys.add(hop.destination_event)
-                matched_event_keys.add(hop.source_event)
-                matched_event_keys.add(hop.destination_event)
-                if hop.score >= self.min_conf.get():
-                    self.hops.appendleft(hop)
-                    self.attach_hop_to_team(hop)
+def parse_osrs_world_list(html_content, include_f2p=False):
+    """
+    Parses official OSRS world list HTML.
+    Uses exact world ID from `id="slu-world-XXX"` attribute to prevent position sorting errors.
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+    worlds = []
 
-            for convergence in convergences:
-                convergence_event_keys.add(convergence.destination_event)
-                convergence_event_keys.update(convergence.source_events)
-                if convergence.score >= self.min_conf.get():
-                    self.convergences.appendleft(convergence)
-                    self.attach_convergence_to_team(convergence)
-                    self.raise_banner(
-                        f"{convergence.source_count} WORLDS → {convergence.destination} • +{convergence.appeared} • {likelihood_label(convergence.score)}"
-                    )
+    # Find elements containing slu-world-XXX IDs
+    elements = soup.find_all(id=re.compile(r'^slu-world-\d+'))
 
-            # Authoritative alert feed: every qualifying movement is represented,
-            # even when it also participates in a successful hop/convergence.
-            for event in new_events:
-                context_parts = []
-                if event.key in hop_event_keys:
-                    context_parts.append("MASS HOP")
-                if event.key in convergence_event_keys:
-                    context_parts.append("CONVERGENCE")
-                watched = self.is_watched(event.world) and event.magnitude >= self.watch_threshold.get()
-                if watched:
-                    context_parts.append("WATCHED WORLD")
-                if not context_parts:
-                    context_parts.append("UNMATCHED MOVEMENT")
-
-                if event.magnitude >= self.world_alert_threshold.get() or watched:
-                    alert = self.make_world_alert(event, now, " + ".join(context_parts), watched)
-                    self.alerts.appendleft(alert)
-                    if watched or not context_parts == ["UNMATCHED MOVEMENT"]:
-                        self.raise_banner(
-                            f"World {event.world} {'INFLUX' if event.amount > 0 else 'OUTFLOW'} {event.magnitude} • {' + '.join(context_parts)}"
-                        )
-
-            # Learn only from immediate polling noise, not from multi-second movement episodes.
-            for world in set(self.previous) & set(current):
-                delta = current[world].players - self.previous[world].players
-                if abs(delta) <= MAX_TRACKED_MOVEMENT:
-                    self.delta_noise[world].append(abs(delta))
-
-            self.previous = current
-            self.update_watch_list()
-            self.expire_teams()
-            self.status.set(f"Updated {time.strftime('%H:%M:%S')} • {len(current)} worlds")
-
-        self.redraw()
-        elapsed = max(0.0, time.time() - self.last_fetch_started)
-        delay_ms = max(700, int(POLL_INTERVAL * 1000 - elapsed * 1000))
-        self.root.after(delay_ms, self.refresh)
-
-    @staticmethod
-    def prune_events(events, now, window_seconds):
-        cutoff = now - window_seconds
-        return deque((event for event in events if event.end_time >= cutoff), maxlen=MAX_HISTORY_EVENTS)
-
-    def hop_recently_reported(self, hop, now):
-        key = (hop.source, hop.destination, hop.source_event, hop.destination_event)
-        cutoff = now - NORMAL_MATCH_WINDOW
-        for stored_key, stamp in list(self.reported_hops.items()):
-            if stamp < cutoff:
-                self.reported_hops.pop(stored_key, None)
-        if key in self.reported_hops:
-            return True
-        self.reported_hops[key] = now
-        return False
-
-    def convergence_recently_reported(self, convergence, now):
-        cutoff = now - CONVERGENCE_WINDOW
-        for stored_key, stamp in list(self.reported_convergences.items()):
-            if stamp < cutoff:
-                self.reported_convergences.pop(stored_key, None)
-        key = (convergence.destination, tuple(sorted(convergence.sources)), convergence.destination_event)
-        if key in self.reported_convergences:
-            return True
-        self.reported_convergences[key] = now
-        return False
-
-    def attach_hop_to_team(self, hop):
-        self.teams = [team for team in self.teams if team.is_alive()]
-        candidates = [team for team in self.teams if team.can_extend(hop)]
-        if candidates:
-            candidates.sort(key=lambda team: (abs(team.size - hop.moved), team.age))
-            candidates[0].add(hop)
-        else:
-            self.teams.insert(0, TeamTrack(first_hop=hop))
-            self.teams = self.teams[:100]
-
-    def attach_convergence_to_team(self, convergence):
-        self.teams = [team for team in self.teams if team.is_alive()]
-        candidates = []
-        for team in self.teams:
-            if team.last_world != convergence.destination:
+    for elem in elements:
+        try:
+            elem_id = elem.get('id', '')
+            match = re.search(r'slu-world-(\d+)', elem_id)
+            if not match:
                 continue
-            ratio = convergence.appeared / max(1, team.size)
-            if 0.35 <= ratio <= 1.80:
-                candidates.append((abs(team.size - convergence.appeared), team.age, team))
-        if candidates:
-            candidates.sort(key=lambda item: (item[0], item[1]))
-            candidates[0][2].reinforce(convergence)
-        else:
-            self.teams.insert(0, TeamTrack(convergence=convergence))
-            self.teams = self.teams[:100]
+            
+            world_id = int(match.group(1))
+            text = elem.get_text(separator=' ', strip=True)
+            
+            # Extract player count
+            players_match = re.search(r'(\d+)\s+players', text, re.IGNORECASE)
+            players = int(players_match.group(1)) if players_match else 0
 
-    def expire_teams(self):
-        self.teams = [team for team in self.teams if team.is_alive()]
+            # Determine membership status
+            is_members = "Members" in text or "members" in text
+            if not is_members and not include_f2p:
+                continue
 
-    def is_watched(self, world):
-        if not self.watch_enabled.get():
-            return False
-        try:
-            return int(self.watch_world.get()) == world
-        except (ValueError, TypeError):
-            return False
+            location = "US" if "United States" in text else ("UK" if "UK" in text else "Global")
+            activity = "PVP" if "PVP" in text else ("Wilderness" if "Wilderness" in text else "Standard")
 
-    def make_world_alert(self, event, now, context, watched):
-        threshold = max(1, self.world_alert_threshold.get())
-        noise = self.delta_noise[event.world]
-        baseline = sum(noise) / len(noise) if noise else 0.0
-        scale = max(float(threshold), baseline * 2.5, 3.0)
-        score = 45 + (event.magnitude / scale) * 10
-        if event.magnitude >= threshold * 2:
-            score += 10
-        if event.magnitude >= threshold * 3:
-            score += 8
-        return WorldAlert(
-            world=event.world,
-            delta=event.amount,
-            score=min(99, max(0, round(score))),
-            timestamp=now,
-            context=context,
-            watched=watched,
-        )
+            worlds.append(WorldSnapshot(world_id, players, location, activity, is_members))
+        except Exception:
+            continue
 
-    def raise_banner(self, text):
-        self.alert_banner.set("ALERT • " + text)
-        if self.sound_alerts.get() and winsound:
-            try:
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            except Exception:
-                pass
-
-    def select_row(self, _event=None):
-        selection = self.tree.selection()
-        if not selection:
-            return
-        values = self.tree.item(selection[0], "values")
-        if self.view == "teams":
-            idx = int(selection[0][1:])
-            visible = [team for team in self.teams if team.score >= self.min_conf.get()]
-            if idx < len(visible):
-                team = visible[idx]
-                seed = ""
-                if team.seed_sources:
-                    seed = f" • convergence sources {', '.join(map(str, team.seed_sources))}"
-                self.detail.set(
-                    f"TEAM • ~{team.size} players • {likelihood_label(team.score)} • last seen {int(team.age)}s ago • route {' → '.join(map(str, team.route))}{seed}"
-                )
-        elif self.view == "hops":
-            self.detail.set(
-                f"World {values[0]} → {values[1]} • {values[2]} left • {values[3]} appeared • estimated group {values[4]} • {values[5]}"
-            )
-        elif self.view == "convergences":
-            self.detail.set(
-                f"{values[0]} → World {values[1]} • destination gain {values[2]} • total source outflow {values[3]} • {values[4]}"
-            )
-        elif self.view == "worlds":
-            self.detail.set(f"World {values[0]} • {values[1]} players • {values[2]} • {values[3]} • {values[4]}")
-        elif self.view == "alerts":
-            self.detail.set(
-                f"World {values[0]} • {values[1].lower()} {abs(int(values[2]))} players • {values[3]} • {values[4]}"
-            )
-
-    def redraw(self):
-        self.tree.delete(*self.tree.get_children())
-        min_conf = self.min_conf.get()
-
-        if self.view == "teams":
-            self.teams = [team for team in self.teams if team.is_alive()]
-            visible = []
-            for team in self.teams:
-                if team.score < min_conf:
-                    continue
-                visible.append(team)
-                self.tree.insert(
-                    "", "end", iid=f"t{len(visible) - 1}",
-                    values=("ACTIVE", " → ".join(map(str, team.route)), f"~{team.size}", team.hop_count, likelihood_label(team.score), f"{int(team.age)}s"),
-                    tags=(likelihood_tag(team.score),),
-                )
-        elif self.view == "hops":
-            for hop in self.hops:
-                if hop.score < min_conf:
-                    continue
-                self.tree.insert(
-                    "", "end",
-                    values=(hop.source, hop.destination, hop.left, hop.appeared, hop.moved, likelihood_label(hop.score), time.strftime("%H:%M:%S", time.localtime(hop.timestamp))),
-                    tags=(likelihood_tag(hop.score),),
-                )
-        elif self.view == "convergences":
-            for convergence in self.convergences:
-                if convergence.score < min_conf:
-                    continue
-                sources = " + ".join(
-                    f"{world} (-{amount})"
-                    for world, amount in zip(convergence.sources, convergence.source_amounts)
-                )
-                self.tree.insert(
-                    "", "end",
-                    values=(sources, convergence.destination, f"+{convergence.appeared}", f"~{convergence.total_outflow}", likelihood_label(convergence.score), time.strftime("%H:%M:%S", time.localtime(convergence.timestamp))),
-                    tags=(likelihood_tag(convergence.score),),
-                )
-        elif self.view == "worlds":
-            try:
-                watched = int(self.watch_world.get()) if self.watch_enabled.get() else None
-            except ValueError:
-                watched = None
-            for world in self.visible_worlds():
-                tags = ("watch",) if world.world == watched else ()
-                self.tree.insert(
-                    "", "end",
-                    values=(world.world, f"{world.players:,}", world.membership, world.location, world.activity),
-                    tags=tags,
-                )
-        else:
-            # Alerts intentionally do not use min_conf as a visibility filter.
-            # The alert threshold means “show movements >= X”, while confidence
-            # is explanatory rather than a gate. This fixes the old cross-view mismatch.
-            for alert in self.alerts:
-                direction = "INFLUX" if alert.delta > 0 else "OUTFLOW"
-                tags = [likelihood_tag(alert.score)]
-                if alert.watched:
-                    tags.append("watch")
-                self.tree.insert(
-                    "", "end",
-                    values=(alert.world, direction, f"{alert.delta:+d}", alert.context, likelihood_label(alert.score), time.strftime("%H:%M:%S", time.localtime(alert.timestamp))),
-                    tags=tuple(tags),
-                )
-
-    def clear_history(self):
-        self.previous = None
-        self.movement_episodes.clear()
-        self.recent_events.clear()
-        self.movement_history.clear()
-        self.hops.clear()
-        self.convergences.clear()
-        self.teams.clear()
-        self.alerts.clear()
-        self.delta_noise.clear()
-        self.reported_hops.clear()
-        self.reported_convergences.clear()
-        self.alert_banner.set("No alerts yet")
-        self.detail.set("History cleared. Waiting for the next snapshot.")
-        self.redraw()
-
-    def close(self):
-        self.root.destroy()
+    return worlds
 
 
-def log_startup_error(exc):
-    try:
-        with STARTUP_LOG.open("a", encoding="utf-8") as stream:
-            stream.write(
-                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {type(exc).__name__}: {exc}\n"
-            )
-    except Exception:
-        pass
-
-
-class PasswordWindow(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.unlocked = False
-        self.title(APP_NAME)
-        self.geometry("460x285")
+class LoginWindow(tk.Toplevel):
+    """Password authorization window requiring default passcode 1234 to unlock."""
+    def __init__(self, parent, on_success):
+        super().__init__(parent)
+        self.parent = parent
+        self.on_success = on_success
+        self.title("Authentication - Cake's OSRS World Tracker")
+        self.geometry("380x220")
         self.resizable(False, False)
-        self.configure(bg="#0b1018")
+        self.protocol("WM_DELETE_WINDOW", self.parent.destroy)
 
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("Login.TFrame", background="#0b1018")
-        style.configure("LoginTitle.TLabel", background="#0b1018", foreground="#f4f7fb", font=("Segoe UI", 17, "bold"))
-        style.configure("LoginText.TLabel", background="#0b1018", foreground="#aeb9ca", font=("Segoe UI", 10))
-        style.configure("Login.TButton", padding=(12, 8), font=("Segoe UI", 10, "bold"))
-        style.configure("LoginError.TLabel", background="#0b1018", foreground="#ff5964", font=("Segoe UI", 9))
+        self.attributes('-topmost', True)
+        self.focus_force()
 
-        frame = ttk.Frame(self, padding=24, style="Login.TFrame")
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text=APP_NAME, style="LoginTitle.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="Enter password to open the tracker", style="LoginText.TLabel").pack(anchor="w", pady=(7, 12))
+        ttk.Label(self, text="Cake's OSRS World Tracker", font=("Helvetica", 12, "bold")).pack(pady=10)
+        ttk.Label(self, text="Enter Password to Unlock:").pack(pady=2)
 
-        self.password = tk.StringVar()
-        self.entry = ttk.Entry(frame, textvariable=self.password, show="*")
-        self.entry.pack(fill="x")
-        self.entry.bind("<Return>", lambda _e: self.unlock())
+        self.entry_pwd = ttk.Entry(self, show="*", width=20)
+        self.entry_pwd.pack(pady=5)
+        self.entry_pwd.focus_set()
+        self.entry_pwd.bind("<Return>", lambda e: self.verify())
 
-        contact = ttk.Frame(frame, style="Login.TFrame")
-        contact.pack(fill="x", pady=(8, 0))
-        ttk.Label(contact, text="Need the password? Discord:", style="LoginText.TLabel").pack(side="left")
-        ttk.Label(contact, text="____cooper_____", style="LoginText.TLabel").pack(side="left", padx=(5, 8))
-        ttk.Button(contact, text="Copy", width=7, command=self.copy_discord).pack(side="left")
+        self.lbl_error = ttk.Label(self, text="", foreground="red")
+        self.lbl_error.pack(pady=2)
 
-        self.error = tk.StringVar()
-        ttk.Label(frame, textvariable=self.error, style="LoginError.TLabel").pack(anchor="w", pady=(6, 0))
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="Unlock", command=self.verify).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Exit", command=self.parent.destroy).pack(side=tk.LEFT, padx=5)
 
-        row = ttk.Frame(frame, style="Login.TFrame")
-        row.pack(fill="x", pady=(12, 0))
-        ttk.Button(row, text="Exit", command=self.cancel, width=12, style="Login.TButton").pack(side="right", padx=(8, 0))
-        ttk.Button(row, text="Unlock", command=self.unlock, width=12, style="Login.TButton").pack(side="right")
+        discord_frame = ttk.Frame(self)
+        discord_frame.pack(pady=10)
+        ttk.Label(discord_frame, text=f"Need password? Contact Discord: {DISCORD_CONTACT}", font=("Helvetica", 8)).pack(side=tk.LEFT)
+        ttk.Button(discord_frame, text="Copy", width=5, command=self.copy_discord).pack(side=tk.LEFT, padx=5)
 
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
-        self.update_idletasks()
-        self.deiconify()
-        self.lift()
-        self.attributes("-topmost", True)
-        self.after(250, lambda: self.attributes("-topmost", False))
-        self.after(50, self.focus_entry)
-        self.grab_set()
-
-    def focus_entry(self):
-        try:
-            self.lift()
-            self.focus_force()
-            self.entry.focus_force()
-        except tk.TclError:
-            pass
+    def verify(self):
+        if self.entry_pwd.get() == DEFAULT_PASSWORD:
+            self.destroy()
+            self.on_success()
+        else:
+            self.lbl_error.config(text="Incorrect password!")
 
     def copy_discord(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append("____cooper_____")
-            self.error.set("Discord username copied.")
-            self.after(1800, lambda: self.error.set(""))
-        except tk.TclError:
-            self.error.set("Could not copy Discord username.")
+        self.clipboard_clear()
+        self.clipboard_append(DISCORD_CONTACT)
+        messagebox.showinfo("Copied", "Discord username copied to clipboard!")
 
-    def unlock(self):
-        if self.password.get() == APP_PASSWORD:
-            self.unlocked = True
+
+class MainGUI(tk.Tk):
+    """Primary Tkinter User Interface."""
+    def __init__(self):
+        super().__init__()
+        self.title("Cake's OSRS World Tracker")
+        self.geometry("900x600")
+        self.withdraw()  # Hide main GUI until authenticated
+
+        self.include_f2p = False
+        self.watched_world_id = None
+        self.watched_threshold = MIN_MOVEMENT_THRESHOLD
+
+        self.episode_tracker = MovementEpisodeTracker(min_threshold=MIN_MOVEMENT_THRESHOLD, max_cap=MAX_TRACKED_MOVEMENT)
+        self.hop_matcher = HopMatcher(window_sec=NORMAL_HOP_WINDOW_SEC)
+        self.convergence_detector = ConvergenceDetector(window_sec=CONVERGENCE_WINDOW_SEC)
+        
+        self.outflow_history = []
+        self.inflow_history = []
+        self.active_teams = {}
+        self.next_team_id = 1
+
+        self.setup_ui()
+        LoginWindow(self, self.on_authenticated)
+
+    def on_authenticated(self):
+        self.deiconify()
+        self.start_polling_thread()
+
+    def setup_ui(self):
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_teams = ttk.Frame(notebook)
+        self.tab_hops = ttk.Frame(notebook)
+        self.tab_convergences = ttk.Frame(notebook)
+        self.tab_alerts = ttk.Frame(notebook)
+
+        notebook.add(self.tab_teams, text="ACTIVE TEAMS")
+        notebook.add(self.tab_hops, text="MASS HOPS")
+        notebook.add(self.tab_convergences, text="CONVERGENCES")
+        notebook.add(self.tab_alerts, text="WORLD ALERTS")
+
+        # Active Teams Treeview
+        self.tree_teams = ttk.Treeview(self.tab_teams, columns=("ID", "Size", "Confidence", "LastWorld", "Route"), show="headings")
+        for col in ("ID", "Size", "Confidence", "LastWorld", "Route"):
+            self.tree_teams.heading(col, text=col)
+        self.tree_teams.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Mass Hops Treeview
+        self.tree_hops = ttk.Treeview(self.tab_hops, columns=("Time", "Source", "Dest", "Outflow", "Inflow", "Confidence"), show="headings")
+        for col in ("Time", "Source", "Dest", "Outflow", "Inflow", "Confidence"):
+            self.tree_hops.heading(col, text=col)
+        self.tree_hops.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Convergences Treeview
+        self.tree_conv = ttk.Treeview(self.tab_convergences, columns=("Time", "DestWorld", "DestInflow", "Sources", "Confidence"), show="headings")
+        for col in ("Time", "DestWorld", "DestInflow", "Sources", "Confidence"):
+            self.tree_conv.heading(col, text=col)
+        self.tree_conv.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # World Alerts Treeview
+        self.tree_alerts = ttk.Treeview(self.tab_alerts, columns=("Time", "World", "Delta", "StartPop", "EndPop"), show="headings")
+        for col in ("Time", "World", "Delta", "StartPop", "EndPop"):
+            self.tree_alerts.heading(col, text=col)
+        self.tree_alerts.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def start_polling_thread(self):
+        t = threading.Thread(target=self.poll_loop, daemon=True)
+        t.start()
+
+    def poll_loop(self):
+        while True:
             try:
-                self.grab_release()
-            except tk.TclError:
+                req = urllib.request.Request("https://oldschool.runescape.com/slu", headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    html = resp.read().decode('utf-8')
+                    snapshots = parse_osrs_world_list(html, include_f2p=self.include_f2p)
+                    self.process_telemetry(snapshots)
+            except Exception as e:
                 pass
-            self.destroy()
+            time.sleep(POLL_INTERVAL_SEC)
+
+    def process_telemetry(self, snapshots):
+        now = time.time()
+        new_events = []
+        for s in snapshots:
+            events = self.episode_tracker.process_snapshot(s)
+            new_events.extend(events)
+
+        if not new_events:
             return
-        self.password.set("")
-        self.error.set("Incorrect password.")
-        self.focus_entry()
 
-    def cancel(self):
-        self.unlocked = False
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        self.destroy()
+        for ev in new_events:
+            # Canonical Movement Event log for World Alerts
+            self.tree_alerts.insert("", 0, values=(time.strftime("%H:%M:%S"), ev.world_id, ev.delta, ev.start_pop, ev.end_pop))
+            if ev.is_outflow:
+                self.outflow_history.append(ev)
+            else:
+                self.inflow_history.append(ev)
 
+        # Run Hop Matching
+        matches = self.hop_matcher.match(self.outflow_history, self.inflow_history)
+        for m in matches:
+            self.tree_hops.insert("", 0, values=(time.strftime("%H:%M:%S"), m['source_world'], m['dest_world'], f"-{m['outflow_size']}", f"+{m['inflow_size']}", m['confidence']))
+            self.associate_hop_to_team(m['source_world'], m['dest_world'], m['inflow_size'], m['confidence'])
 
-def run_app():
-    try:
-        login = PasswordWindow()
-        login.mainloop()
-        if not login.unlocked:
-            return
-        root = tk.Tk()
-        App(root)
-        root.mainloop()
-    except Exception as exc:
-        log_startup_error(exc)
-        try:
-            from tkinter import messagebox
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror(
-                APP_NAME,
-                f"The program could not start.\n\n{type(exc).__name__}: {exc}\n\nLog: {STARTUP_LOG}",
-            )
-            root.destroy()
-        except Exception:
-            pass
+        # Run Convergence Detection
+        convergences = self.convergence_detector.detect(self.outflow_history, self.inflow_history)
+        for c in convergences:
+            sources_str = ", ".join([f"W{s[0]}(-{s[1]})" for s in c['sources']])
+            self.tree_conv.insert("", 0, values=(time.strftime("%H:%M:%S"), c['dest_world'], f"+{c['dest_inflow']}", sources_str, c['confidence']))
+            self.associate_convergence_to_team(c['dest_world'], c['dest_inflow'], c['confidence'])
+
+        # Prune inactive teams older than 1 hour
+        expired_ids = [t_id for t_id, t in self.active_teams.items() if t.is_expired(now, TEAM_EXPIRY_SEC)]
+        for t_id in expired_ids:
+            del self.active_teams[t_id]
+
+        self.refresh_teams_ui()
+
+    def associate_hop_to_team(self, src_world, dest_world, size, confidence):
+        # Check if hop continues an existing team's route
+        matched_team = None
+        for team in self.active_teams.values():
+            if team.last_known_world == src_world:
+                matched_team = team
+                break
+
+        if matched_team:
+            matched_team.record_hop(dest_world, size, confidence)
+        else:
+            new_id = f"TEAM #{self.next_team_id}"
+            self.next_team_id += 1
+            t = InferredTeam(new_id, src_world, size, confidence)
+            t.record_hop(dest_world, size, confidence)
+            self.active_teams[new_id] = t
+
+    def associate_convergence_to_team(self, dest_world, size, confidence):
+        new_id = f"TEAM #{self.next_team_id}"
+        self.next_team_id += 1
+        t = InferredTeam(new_id, dest_world, size, confidence)
+        t.record_convergence(dest_world, size, confidence)
+        self.active_teams[new_id] = t
+
+    def refresh_teams_ui(self):
+        for item in self.tree_teams.get_children():
+            self.tree_teams.delete(item)
+        for team in self.active_teams.values():
+            route_str = " -> ".join(map(str, team.route))
+            self.tree_teams.insert("", tk.END, values=(team.team_id, f"~{team.approx_size}", team.confidence, team.last_known_world, route_str))
 
 
 if __name__ == "__main__":
-    run_app()
+    app = MainGUI()
+    app.mainloop()
