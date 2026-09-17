@@ -8,10 +8,10 @@ PK teams moving across Old School RuneScape (OSRS) worlds via population telemet
 import time
 import re
 import threading
+import urllib.request
+from html.parser import HTMLParser
 import tkinter as tk
 from tkinter import ttk, messagebox, font
-import urllib.request
-from bs4 import BeautifulSoup
 
 # Global Configuration & Defaults
 DEFAULT_PASSWORD = "1234"
@@ -35,12 +35,77 @@ class WorldSnapshot:
         self.timestamp = time.time()
 
 
+class OSRSWorldHTMLParser(HTMLParser):
+    """
+    Standard library HTML parser to extract OSRS world telemetry.
+    Extracts exact world ID directly from id="slu-world-XXX" attributes.
+    """
+    def __init__(self, include_f2p=False):
+        super().__init__()
+        self.include_f2p = include_f2p
+        self.worlds = []
+        self.current_world_id = None
+        self.current_data = []
+
+    def handle_starttag(self, tag, attrs):
+        attr_dict = dict(attrs)
+        element_id = attr_dict.get('id', '')
+        match = re.search(r'slu-world-(\d+)', element_id)
+        if match:
+            self.current_world_id = int(match.group(1))
+            self.current_data = []
+
+    def handle_data(self, data):
+        if self.current_world_id is not None:
+            self.current_data.append(data)
+
+    def handle_endtag(self, tag):
+        if self.current_world_id is not None and tag in ['tr', 'div', 'li']:
+            full_text = ' '.join(self.current_data)
+            players_match = re.search(r'(\d+)\s+players', full_text, re.IGNORECASE)
+            players = int(players_match.group(1)) if players_match else 0
+
+            is_members = "Members" in full_text or "members" in full_text
+            location = "US" if "United States" in full_text else ("UK" if "UK" in full_text else "Global")
+            activity = "PVP" if "PVP" in full_text else ("Wilderness" if "Wilderness" in full_text else "Standard")
+
+            if is_members or self.include_f2p:
+                self.worlds.append(WorldSnapshot(self.current_world_id, players, location, activity, is_members))
+
+            self.current_world_id = None
+            self.current_data = []
+
+
+def parse_osrs_world_list(html_content, include_f2p=False):
+    """Parses OSRS world list HTML using regex and standard library parsing."""
+    parser = OSRSWorldHTMLParser(include_f2p=include_f2p)
+    parser.feed(html_content)
+    
+    # Fallback to direct Regex parsing if tag structure varies
+    if not parser.worlds:
+        pattern = r'id="slu-world-(\d+)"[^>]*>(.*?)</(?:tr|div|li)>'
+        matches = re.findall(pattern, html_content, re.DOTALL | re.IGNORECASE)
+        for world_str, content_str in matches:
+            w_id = int(world_str)
+            text = re.sub(r'<[^>]+>', ' ', content_str)
+            p_match = re.search(r'(\d+)\s+players', text, re.IGNORECASE)
+            players = int(p_match.group(1)) if p_match else 0
+            is_mem = "Members" in text or "members" in text
+            loc = "US" if "United States" in text else ("UK" if "UK" in text else "Global")
+            act = "PVP" if "PVP" in text else ("Wilderness" if "Wilderness" in text else "Standard")
+            
+            if is_mem or include_f2p:
+                parser.worlds.append(WorldSnapshot(w_id, players, loc, act, is_mem))
+
+    return parser.worlds
+
+
 class MovementEvent:
     """Canonical movement event emitted when a qualifying population change occurs."""
     def __init__(self, world_id, delta, start_pop, end_pop, start_time, end_time):
         self.event_id = f"{world_id}_{int(start_time)}_{delta}"
         self.world_id = world_id
-        self.delta = delta  # Negative = outflow, Positive = inflow
+        self.delta = delta
         self.start_pop = start_pop
         self.end_pop = end_pop
         self.start_time = start_time
@@ -60,16 +125,13 @@ class MovementEvent:
 
 
 class MovementEpisodeTracker:
-    """
-    Groups sequential 2-second deltas into continuous movement episodes to avoid delta spam.
-    Example: 1000 -> 994 -> 979 -> 970 becomes a single outflow episode.
-    """
+    """Groups sequential 2-second deltas into continuous movement episodes."""
     def __init__(self, min_threshold=10, max_cap=400, quiet_reset_sec=6.0):
         self.min_threshold = min_threshold
         self.max_cap = max_cap
         self.quiet_reset_sec = quiet_reset_sec
-        self.active_episodes = {}  # world_id -> dict state
-        self.last_seen_pop = {}    # world_id -> int
+        self.active_episodes = {}
+        self.last_seen_pop = {}
 
     def process_snapshot(self, snapshot):
         w_id = snapshot.world_id
@@ -84,7 +146,6 @@ class MovementEpisodeTracker:
         prev_pop = self.last_seen_pop[w_id]
         delta = curr_pop - prev_pop
 
-        # If population hasn't changed, check if active episode needs finalizing
         if delta == 0:
             if w_id in self.active_episodes:
                 ep = self.active_episodes[w_id]
@@ -95,13 +156,11 @@ class MovementEpisodeTracker:
             self.last_seen_pop[w_id] = curr_pop
             return emitted_events
 
-        # Reject massive multi-hundred swings (world resets / sorting errors)
         if abs(delta) > self.max_cap:
             self.last_seen_pop[w_id] = curr_pop
             return emitted_events
 
         if w_id not in self.active_episodes:
-            # Start new episode
             self.active_episodes[w_id] = {
                 'start_pop': prev_pop,
                 'end_pop': curr_pop,
@@ -114,12 +173,10 @@ class MovementEpisodeTracker:
             ep = self.active_episodes[w_id]
             curr_dir = 1 if delta > 0 else -1
 
-            # Direction reversal triggers episode finalization
             if curr_dir != ep['direction']:
                 event = self._finalize_episode(w_id)
                 if event:
                     emitted_events.append(event)
-                # Re-initiate new episode direction
                 self.active_episodes[w_id] = {
                     'start_pop': prev_pop,
                     'end_pop': curr_pop,
@@ -129,12 +186,10 @@ class MovementEpisodeTracker:
                     'direction': curr_dir
                 }
             else:
-                # Continue accumulating in same direction
                 ep['end_pop'] = curr_pop
                 ep['accumulated_delta'] += delta
                 ep['last_update'] = now
 
-                # If single accumulation jump is large enough, emit early to maintain responsiveness
                 if abs(ep['accumulated_delta']) >= self.min_threshold:
                     event = self._finalize_episode(w_id)
                     if event:
@@ -177,12 +232,10 @@ class InferredTeam:
     def record_hop(self, to_world, observed_size, hop_confidence):
         self.route.append(to_world)
         self.last_known_world = to_world
-        # Running average size estimation
         self.approx_size = int((self.approx_size * 0.6) + (observed_size * 0.4))
         self.hop_count += 1
         self.last_activity = time.time()
 
-        # Repeated compatible movement upgrades overall team confidence
         if self.hop_count >= 3 and self.confidence in ["POSSIBLE", "LIKELY"]:
             self.confidence = "VERY LIKELY"
         elif self.hop_count >= 1 and self.confidence == "POSSIBLE":
@@ -215,9 +268,8 @@ class HopMatcher:
 
                 time_diff = abs(inf.start_time - out.start_time)
                 if time_diff <= self.window_sec:
-                    # Assess size compatibility
                     ratio = min(out.magnitude, inf.magnitude) / max(out.magnitude, inf.magnitude)
-                    if ratio >= 0.35:  # Tolerate partial observations
+                    if ratio >= 0.35:
                         confidence = "VERY LIKELY" if ratio >= 0.75 else ("LIKELY" if ratio >= 0.5 else "POSSIBLE")
                         matches.append({
                             'source_world': out.world_id,
@@ -262,46 +314,6 @@ class ConvergenceDetector:
                     'timestamp': inf.end_time
                 })
         return convergences
-
-
-def parse_osrs_world_list(html_content, include_f2p=False):
-    """
-    Parses official OSRS world list HTML.
-    Uses exact world ID from `id="slu-world-XXX"` attribute to prevent position sorting errors.
-    """
-    soup = BeautifulSoup(html_content, 'html.parser')
-    worlds = []
-
-    # Find elements containing slu-world-XXX IDs
-    elements = soup.find_all(id=re.compile(r'^slu-world-\d+'))
-
-    for elem in elements:
-        try:
-            elem_id = elem.get('id', '')
-            match = re.search(r'slu-world-(\d+)', elem_id)
-            if not match:
-                continue
-            
-            world_id = int(match.group(1))
-            text = elem.get_text(separator=' ', strip=True)
-            
-            # Extract player count
-            players_match = re.search(r'(\d+)\s+players', text, re.IGNORECASE)
-            players = int(players_match.group(1)) if players_match else 0
-
-            # Determine membership status
-            is_members = "Members" in text or "members" in text
-            if not is_members and not include_f2p:
-                continue
-
-            location = "US" if "United States" in text else ("UK" if "UK" in text else "Global")
-            activity = "PVP" if "PVP" in text else ("Wilderness" if "Wilderness" in text else "Standard")
-
-            worlds.append(WorldSnapshot(world_id, players, location, activity, is_members))
-        except Exception:
-            continue
-
-    return worlds
 
 
 class LoginWindow(tk.Toplevel):
@@ -358,7 +370,7 @@ class MainGUI(tk.Tk):
         super().__init__()
         self.title("Cake's OSRS World Tracker")
         self.geometry("900x600")
-        self.withdraw()  # Hide main GUI until authenticated
+        self.withdraw()
 
         self.include_f2p = False
         self.watched_world_id = None
@@ -394,25 +406,21 @@ class MainGUI(tk.Tk):
         notebook.add(self.tab_convergences, text="CONVERGENCES")
         notebook.add(self.tab_alerts, text="WORLD ALERTS")
 
-        # Active Teams Treeview
         self.tree_teams = ttk.Treeview(self.tab_teams, columns=("ID", "Size", "Confidence", "LastWorld", "Route"), show="headings")
         for col in ("ID", "Size", "Confidence", "LastWorld", "Route"):
             self.tree_teams.heading(col, text=col)
         self.tree_teams.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Mass Hops Treeview
         self.tree_hops = ttk.Treeview(self.tab_hops, columns=("Time", "Source", "Dest", "Outflow", "Inflow", "Confidence"), show="headings")
         for col in ("Time", "Source", "Dest", "Outflow", "Inflow", "Confidence"):
             self.tree_hops.heading(col, text=col)
         self.tree_hops.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Convergences Treeview
         self.tree_conv = ttk.Treeview(self.tab_convergences, columns=("Time", "DestWorld", "DestInflow", "Sources", "Confidence"), show="headings")
         for col in ("Time", "DestWorld", "DestInflow", "Sources", "Confidence"):
             self.tree_conv.heading(col, text=col)
         self.tree_conv.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # World Alerts Treeview
         self.tree_alerts = ttk.Treeview(self.tab_alerts, columns=("Time", "World", "Delta", "StartPop", "EndPop"), show="headings")
         for col in ("Time", "World", "Delta", "StartPop", "EndPop"):
             self.tree_alerts.heading(col, text=col)
@@ -430,7 +438,7 @@ class MainGUI(tk.Tk):
                     html = resp.read().decode('utf-8')
                     snapshots = parse_osrs_world_list(html, include_f2p=self.include_f2p)
                     self.process_telemetry(snapshots)
-            except Exception as e:
+            except Exception:
                 pass
             time.sleep(POLL_INTERVAL_SEC)
 
@@ -445,27 +453,23 @@ class MainGUI(tk.Tk):
             return
 
         for ev in new_events:
-            # Canonical Movement Event log for World Alerts
             self.tree_alerts.insert("", 0, values=(time.strftime("%H:%M:%S"), ev.world_id, ev.delta, ev.start_pop, ev.end_pop))
             if ev.is_outflow:
                 self.outflow_history.append(ev)
             else:
                 self.inflow_history.append(ev)
 
-        # Run Hop Matching
         matches = self.hop_matcher.match(self.outflow_history, self.inflow_history)
         for m in matches:
             self.tree_hops.insert("", 0, values=(time.strftime("%H:%M:%S"), m['source_world'], m['dest_world'], f"-{m['outflow_size']}", f"+{m['inflow_size']}", m['confidence']))
             self.associate_hop_to_team(m['source_world'], m['dest_world'], m['inflow_size'], m['confidence'])
 
-        # Run Convergence Detection
         convergences = self.convergence_detector.detect(self.outflow_history, self.inflow_history)
         for c in convergences:
             sources_str = ", ".join([f"W{s[0]}(-{s[1]})" for s in c['sources']])
             self.tree_conv.insert("", 0, values=(time.strftime("%H:%M:%S"), c['dest_world'], f"+{c['dest_inflow']}", sources_str, c['confidence']))
             self.associate_convergence_to_team(c['dest_world'], c['dest_inflow'], c['confidence'])
 
-        # Prune inactive teams older than 1 hour
         expired_ids = [t_id for t_id, t in self.active_teams.items() if t.is_expired(now, TEAM_EXPIRY_SEC)]
         for t_id in expired_ids:
             del self.active_teams[t_id]
@@ -473,7 +477,6 @@ class MainGUI(tk.Tk):
         self.refresh_teams_ui()
 
     def associate_hop_to_team(self, src_world, dest_world, size, confidence):
-        # Check if hop continues an existing team's route
         matched_team = None
         for team in self.active_teams.values():
             if team.last_known_world == src_world:
