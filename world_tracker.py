@@ -327,7 +327,6 @@ class LoginWindow(tk.Toplevel):
         self.attributes('-topmost', True)
         self.focus_force()
 
-        # Custom Styling
         lbl_title = tk.Label(self, text="CAKE'S WORLD TRACKER", font=("Segoe UI", 14, "bold"), fg="#cba6f7", bg="#1e1e2e")
         lbl_title.pack(pady=(20, 5))
 
@@ -345,10 +344,10 @@ class LoginWindow(tk.Toplevel):
         btn_frame = tk.Frame(self, bg="#1e1e2e")
         btn_frame.pack(pady=10)
         
-        btn_unlock = tk.Button(btn_frame, text="UNLOCK", font=("Segoe UI", 9, "bold"), bg="#a6e3a1", fg="#11111b", activebackground="#94e2d5", relief="flat", px=15, py=4, command=self.verify)
+        btn_unlock = tk.Button(btn_frame, text="UNLOCK", font=("Segoe UI", 9, "bold"), bg="#a6e3a1", fg="#11111b", activebackground="#94e2d5", relief="flat", padx=15, pady=4, command=self.verify)
         btn_unlock.pack(side=tk.LEFT, padx=5)
 
-        btn_exit = tk.Button(btn_frame, text="EXIT", font=("Segoe UI", 9), bg="#45475a", fg="#cdd6f4", activebackground="#585b70", relief="flat", px=15, py=4, command=self.parent.destroy)
+        btn_exit = tk.Button(btn_frame, text="EXIT", font=("Segoe UI", 9), bg="#45475a", fg="#cdd6f4", activebackground="#585b70", relief="flat", padx=15, pady=4, command=self.parent.destroy)
         btn_exit.pack(side=tk.LEFT, padx=5)
 
         discord_frame = tk.Frame(self, bg="#1e1e2e")
@@ -379,7 +378,6 @@ class MainGUI(tk.Tk):
         self.configure(bg="#181825")
         self.withdraw()
 
-        # Configurable Settings State
         self.min_threshold_var = tk.IntVar(value=DEFAULT_MIN_MOVEMENT)
         self.max_cap_var = tk.IntVar(value=DEFAULT_MAX_MOVEMENT)
         self.f2p_var = tk.BooleanVar(value=False)
@@ -403,13 +401,11 @@ class MainGUI(tk.Tk):
         style = ttk.Style()
         style.theme_use('clam')
 
-        # Global Colors
         style.configure(".", background="#181825", foreground="#cdd6f4", font=("Segoe UI", 9))
         style.configure("TNotebook", background="#181825", borderwidth=0)
         style.configure("TNotebook.Tab", background="#313244", foreground="#bac2de", padding=[12, 6], font=("Segoe UI", 10, "bold"))
         style.map("TNotebook.Tab", background=[("selected", "#cba6f7")], foreground=[("selected", "#11111b")])
 
-        # Treeview Styling
         style.configure("Treeview", background="#1e1e2e", fieldbackground="#1e1e2e", foreground="#cdd6f4", rowheight=26, borderwidth=0)
         style.configure("Treeview.Heading", background="#313244", foreground="#cba6f7", font=("Segoe UI", 9, "bold"), relief="flat")
         style.map("Treeview", background=[("selected", "#45475a")], foreground=[("selected", "#f5e0dc")])
@@ -419,13 +415,11 @@ class MainGUI(tk.Tk):
         self.start_polling_thread()
 
     def setup_ui(self):
-        # Header Toolbar & Dynamic Settings Control Bar
-        header_frame = tk.Frame(self, bg="#1e1e2e", py=8, px=15)
+        header_frame = tk.Frame(self, bg="#1e1e2e", pady=8, padx=15)
         header_frame.pack(fill=tk.X, side=tk.TOP)
 
         tk.Label(header_frame, text="CAKE'S OSRS WORLD TRACKER", font=("Segoe UI", 12, "bold"), fg="#cba6f7", bg="#1e1e2e").pack(side=tk.LEFT)
 
-        # Settings Controls Group
         settings_group = tk.Frame(header_frame, bg="#1e1e2e")
         settings_group.pack(side=tk.RIGHT)
 
@@ -444,7 +438,6 @@ class MainGUI(tk.Tk):
         entry_watch = tk.Entry(settings_group, textvariable=self.watched_world_var, width=5, font=("Segoe UI", 8), bg="#313244", fg="#cdd6f4", justify="center", relief="flat")
         entry_watch.pack(side=tk.LEFT, padx=2)
 
-        # Tabs Container
         notebook = ttk.Notebook(self)
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -458,36 +451,31 @@ class MainGUI(tk.Tk):
         notebook.add(self.tab_convergences, text=" 🎯 CONVERGENCES ")
         notebook.add(self.tab_alerts, text=" 🚨 WORLD ALERTS ")
 
-        # Active Teams View
         self.tree_teams = ttk.Treeview(self.tab_teams, columns=("ID", "Size", "Confidence", "LastWorld", "Route"), show="headings")
         self.setup_tree_columns(self.tree_teams, [
             ("ID", 100), ("Size", 100), ("Confidence", 120), ("LastWorld", 120), ("Route", 400)
         ])
         self.tree_teams.pack(fill=tk.BOTH, expand=True)
 
-        # Mass Hops View
         self.tree_hops = ttk.Treeview(self.tab_hops, columns=("Time", "Source", "Dest", "Outflow", "Inflow", "Confidence"), show="headings")
         self.setup_tree_columns(self.tree_hops, [
             ("Time", 100), ("Source", 120), ("Dest", 120), ("Outflow", 120), ("Inflow", 120), ("Confidence", 140)
         ])
         self.tree_hops.pack(fill=tk.BOTH, expand=True)
 
-        # Convergences View
         self.tree_conv = ttk.Treeview(self.tab_convergences, columns=("Time", "DestWorld", "DestInflow", "Sources", "Confidence"), show="headings")
         self.setup_tree_columns(self.tree_conv, [
             ("Time", 100), ("DestWorld", 120), ("DestInflow", 120), ("Sources", 350), ("Confidence", 140)
         ])
         self.tree_conv.pack(fill=tk.BOTH, expand=True)
 
-        # World Alerts View
         self.tree_alerts = ttk.Treeview(self.tab_alerts, columns=("Time", "World", "Delta", "StartPop", "EndPop"), show="headings")
         self.setup_tree_columns(self.tree_alerts, [
             ("Time", 120), ("World", 120), ("Delta", 120), ("StartPop", 140), ("EndPop", 140)
         ])
         self.tree_alerts.pack(fill=tk.BOTH, expand=True)
 
-        # Footer Status Bar
-        self.status_bar = tk.Label(self, text="Status: Initializing Telemetry Connection...", font=("Segoe UI", 8), fg="#a6adc8", bg="#181825", anchor="w", px=15, py=4)
+        self.status_bar = tk.Label(self, text="Status: Initializing Telemetry Connection...", font=("Segoe UI", 8), fg="#a6adc8", bg="#181825", anchor="w", padx=15, pady=4)
         self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
     def setup_tree_columns(self, tree, columns):
@@ -496,7 +484,6 @@ class MainGUI(tk.Tk):
             tree.column(col, width=width, anchor="center")
 
     def apply_settings(self):
-        """Live updates settings parameters inside episode tracker."""
         self.episode_tracker.min_threshold = self.min_threshold_var.get()
         self.episode_tracker.max_cap = self.max_cap_var.get()
         self.status_bar.config(text=f"Settings updated: Min Group Size={self.min_threshold_var.get()}, Max Cap={self.max_cap_var.get()}")
@@ -515,7 +502,7 @@ class MainGUI(tk.Tk):
                     self.snapshots_count += 1
                     self.process_telemetry(snapshots)
                     self.status_bar.config(text=f"Telemetry Active — Polled {len(snapshots)} worlds — Total snapshots: {self.snapshots_count}")
-            except Exception as e:
+            except Exception:
                 self.status_bar.config(text="Telemetry Warning: Reconnecting to OSRS world list...")
             time.sleep(POLL_INTERVAL_SEC)
 
@@ -532,7 +519,6 @@ class MainGUI(tk.Tk):
         watched_world = self.watched_world_var.get().strip()
 
         for ev in new_events:
-            # Watched world or threshold filter
             if not watched_world or str(ev.world_id) == watched_world:
                 self.tree_alerts.insert("", 0, values=(time.strftime("%H:%M:%S"), f"World {ev.world_id}", f"{ev.delta:+d}", ev.start_pop, ev.end_pop))
 
@@ -541,20 +527,17 @@ class MainGUI(tk.Tk):
             else:
                 self.inflow_history.append(ev)
 
-        # Process Hop Matching
         matches = self.hop_matcher.match(self.outflow_history, self.inflow_history)
         for m in matches:
             self.tree_hops.insert("", 0, values=(time.strftime("%H:%M:%S"), f"W{m['source_world']}", f"W{m['dest_world']}", f"-{m['outflow_size']}", f"+{m['inflow_size']}", m['confidence']))
             self.associate_hop_to_team(m['source_world'], m['dest_world'], m['inflow_size'], m['confidence'])
 
-        # Process Multi-World Convergence Detection
         convergences = self.convergence_detector.detect(self.outflow_history, self.inflow_history)
         for c in convergences:
             sources_str = ", ".join([f"W{s[0]}(-{s[1]})" for s in c['sources']])
             self.tree_conv.insert("", 0, values=(time.strftime("%H:%M:%S"), f"W{c['dest_world']}", f"+{c['dest_inflow']}", sources_str, c['confidence']))
             self.associate_convergence_to_team(c['dest_world'], c['dest_inflow'], c['confidence'])
 
-        # Expire teams inactive > 1 hour
         expired_ids = [t_id for t_id, t in self.active_teams.items() if t.is_expired(now, TEAM_EXPIRY_SEC)]
         for t_id in expired_ids:
             del self.active_teams[t_id]
